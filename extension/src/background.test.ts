@@ -29,6 +29,15 @@ const leaseKey = (surface: 'browser' | 'adapter', session: string): string =>
 const browserKey = (session: string): string => leaseKey('browser', session);
 const adapterKey = (session: string): string => leaseKey('adapter', session);
 
+const TEST_DAEMON_TOKEN = 'a'.repeat(64);
+
+/** Serve extension/daemon-token.json; every other fetch goes to `daemonFetch`. */
+function withDaemonToken<F extends (...args: any[]) => any>(daemonFetch: F, token: unknown = TEST_DAEMON_TOKEN) {
+  return vi.fn((url: string, init?: RequestInit) => String(url).endsWith('/daemon-token.json')
+    ? Promise.resolve({ ok: true, status: 200, json: async () => ({ token }) })
+    : daemonFetch(url, init));
+}
+
 class MockWebSocket {
   static OPEN = 1;
   static CONNECTING = 0;
@@ -41,7 +50,10 @@ class MockWebSocket {
   onclose: (() => void) | null = null;
   onerror: (() => void) | null = null;
 
-  constructor(_url: string) {
+  url: string;
+
+  constructor(url: string) {
+    this.url = url;
     MockWebSocket.instances.push(this);
   }
   send(data: string): void {
@@ -1175,7 +1187,7 @@ describe('background tab isolation', () => {
   it('keeps the active daemon connection when a superseded WebSocket closes later', async () => {
     const { chrome } = createChromeMock();
     vi.stubGlobal('chrome', chrome);
-    vi.stubGlobal('fetch', vi.fn(async () => ({ ok: true })));
+    vi.stubGlobal('fetch', withDaemonToken(vi.fn(async () => ({ ok: true }))));
 
     await import('./background');
     await vi.waitFor(() => {
@@ -1213,7 +1225,7 @@ describe('background tab isolation', () => {
     vi.stubGlobal('chrome', chrome);
     const ping = deferred<{ ok: boolean }>();
     const fetchMock = vi.fn(() => ping.promise);
-    vi.stubGlobal('fetch', fetchMock);
+    vi.stubGlobal('fetch', withDaemonToken(fetchMock));
 
     await import('./background');
     await vi.waitFor(() => {
@@ -1236,7 +1248,7 @@ describe('background tab isolation', () => {
   it('uses the production-safe 30s keepalive alarm period', async () => {
     const { chrome } = createChromeMock();
     vi.stubGlobal('chrome', chrome);
-    vi.stubGlobal('fetch', vi.fn(async () => ({ ok: false })));
+    vi.stubGlobal('fetch', withDaemonToken(vi.fn(async () => ({ ok: false }))));
 
     await import('./background');
 
@@ -1246,7 +1258,7 @@ describe('background tab isolation', () => {
   it('reconnect delay backs off exponentially with a 15s cap and resets on success', async () => {
     const { chrome } = createChromeMock();
     vi.stubGlobal('chrome', chrome);
-    vi.stubGlobal('fetch', vi.fn(async () => ({ ok: false })));
+    vi.stubGlobal('fetch', withDaemonToken(vi.fn(async () => ({ ok: false }))));
 
     const mod = await import('./background');
     mod.__test__.resetReconnectState();
@@ -1270,7 +1282,7 @@ describe('background tab isolation', () => {
   it('a successful daemon ping resets the backoff before the WebSocket attempt', async () => {
     const { chrome } = createChromeMock();
     vi.stubGlobal('chrome', chrome);
-    vi.stubGlobal('fetch', vi.fn(async () => ({ ok: true })));
+    vi.stubGlobal('fetch', withDaemonToken(vi.fn(async () => ({ ok: true }))));
 
     const mod = await import('./background');
     mod.__test__.resetReconnectState();
@@ -1287,7 +1299,7 @@ describe('background tab isolation', () => {
     vi.stubGlobal('chrome', chrome);
     const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
     const fetchMock = vi.fn(async (_url: string, _init?: RequestInit) => ({ ok: false, status: 431 }));
-    vi.stubGlobal('fetch', fetchMock);
+    vi.stubGlobal('fetch', withDaemonToken(fetchMock));
 
     await import('./background');
 
@@ -1306,10 +1318,52 @@ describe('background tab isolation', () => {
     warnSpy.mockRestore();
   });
 
+  it('dials the daemon WebSocket with the token from daemon-token.json and never stores it', async () => {
+    const { chrome } = createChromeMock();
+    vi.stubGlobal('chrome', chrome);
+    vi.stubGlobal('fetch', withDaemonToken(vi.fn(async () => ({ ok: true }))));
+
+    const mod = await import('./background');
+    await mod.__test__.connectForTest();
+
+    expect(MockWebSocket.instances.length).toBeGreaterThanOrEqual(1);
+    expect(MockWebSocket.instances[0].url).toBe(`ws://127.0.0.1:19825/ext?token=${TEST_DAEMON_TOKEN}`);
+    const stored = JSON.stringify([
+      ...chrome.storage.local.set.mock.calls,
+      ...chrome.storage.session.set.mock.calls,
+    ]);
+    expect(stored).not.toContain(TEST_DAEMON_TOKEN);
+  });
+
+  it.each([
+    ['missing', null],
+    ['too short', 'short'],
+  ])('does not contact the daemon when daemon-token.json is %s, and warns once without the value', async (_label, token) => {
+    const { chrome } = createChromeMock();
+    vi.stubGlobal('chrome', chrome);
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const daemonFetch = vi.fn(async () => ({ ok: true }));
+    const fetchMock = token === null
+      ? vi.fn(async (url: string) => String(url).endsWith('/daemon-token.json') ? ({ ok: false, status: 404 }) : daemonFetch())
+      : withDaemonToken(daemonFetch, token);
+    vi.stubGlobal('fetch', fetchMock);
+
+    const mod = await import('./background');
+    await mod.__test__.connectForTest();
+    await mod.__test__.connectForTest();
+
+    expect(daemonFetch).not.toHaveBeenCalled();
+    expect(MockWebSocket.instances).toHaveLength(0);
+    const tokenWarnings = warnSpy.mock.calls.filter((args) => String(args[0]).includes('daemon-token.json'));
+    expect(tokenWarnings).toHaveLength(1);
+    if (token) expect(String(tokenWarnings[0][0])).not.toContain(token);
+    warnSpy.mockRestore();
+  });
+
   it('ignores daemon commands delivered to a superseded WebSocket', async () => {
     const { chrome } = createChromeMock();
     vi.stubGlobal('chrome', chrome);
-    vi.stubGlobal('fetch', vi.fn(async () => ({ ok: true })));
+    vi.stubGlobal('fetch', withDaemonToken(vi.fn(async () => ({ ok: true }))));
 
     await import('./background');
     await vi.waitFor(() => {

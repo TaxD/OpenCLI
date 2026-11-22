@@ -11,12 +11,26 @@ import {
   setDaemonCommandTimeoutSeconds,
   setDaemonRunContext,
 } from './daemon-client.js';
-import { SessionBusyError } from '../errors.js';
+import { BrowserConnectError, SessionBusyError } from '../errors.js';
+import * as fs from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
 import * as daemonLifecycle from './daemon-lifecycle.js';
+
+const TEST_TOKEN = 't'.repeat(64);
+
+/** Point the CLI at a throwaway 0600 token file instead of ~/.opencli/daemon-token. */
+function useTestTokenFile(): void {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'opencli-client-'));
+  const file = path.join(dir, 'daemon-token');
+  fs.writeFileSync(file, TEST_TOKEN, { mode: 0o600 });
+  vi.stubEnv('OPENCLI_DAEMON_TOKEN_FILE', file);
+}
 
 describe('daemon-client', () => {
   beforeEach(() => {
     vi.stubGlobal('fetch', vi.fn());
+    useTestTokenFile();
   });
 
   afterEach(() => {
@@ -46,9 +60,25 @@ describe('daemon-client', () => {
     expect(fetchMock).toHaveBeenCalledWith(
       expect.stringMatching(/\/status$/),
       expect.objectContaining({
-        headers: expect.objectContaining({ 'X-OpenCLI': '1' }),
+        headers: expect.objectContaining({ 'X-OpenCLI': '1', Authorization: `Bearer ${TEST_TOKEN}` }),
       }),
     );
+  });
+
+  it('omits Authorization when the token file is missing', async () => {
+    vi.stubEnv('OPENCLI_DAEMON_TOKEN_FILE', path.join(os.tmpdir(), 'opencli-no-such-dir', 'daemon-token'));
+    const fetchMock = vi.mocked(fetch);
+    fetchMock.mockResolvedValue({ ok: true } as Response);
+    await requestDaemonShutdown();
+    const headers = (fetchMock.mock.calls[0][1] as RequestInit).headers as Record<string, string>;
+    expect(headers).not.toHaveProperty('Authorization');
+  });
+
+  it('fetchDaemonStatus surfaces a 401 as a BrowserConnectError instead of "stopped"', async () => {
+    vi.mocked(fetch).mockResolvedValue({ ok: false, status: 401 } as Response);
+    const err = await fetchDaemonStatus().catch((e) => e);
+    expect(err).toBeInstanceOf(BrowserConnectError);
+    expect(String(err.message) + String(err.hint)).not.toContain(TEST_TOKEN);
   });
 
   it('fetchDaemonStatus returns null on network failure', async () => {
@@ -66,7 +96,7 @@ describe('daemon-client', () => {
       expect.stringMatching(/\/shutdown$/),
       expect.objectContaining({
         method: 'POST',
-        headers: expect.objectContaining({ 'X-OpenCLI': '1' }),
+        headers: expect.objectContaining({ 'X-OpenCLI': '1', Authorization: `Bearer ${TEST_TOKEN}` }),
       }),
     );
   });

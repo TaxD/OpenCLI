@@ -109,6 +109,36 @@ console.error = (...args: unknown[]) => { _origError(...args); forwardLog('error
 
 // ─── WebSocket connection ────────────────────────────────────────────
 
+/**
+ * Shared secret for the local daemon, written next to manifest.json by the
+ * installer as daemon-token.json ({ "token": "..." }). Not web-accessible, so
+ * pages and other extensions cannot read it. Re-read on every connect attempt
+ * (never persisted to chrome.storage) so a rotated token is picked up.
+ */
+const DAEMON_TOKEN_RE = /^[A-Za-z0-9_-]{32,}$/;
+let daemonTokenProblemLogged = false;
+
+async function loadDaemonToken(): Promise<string | null> {
+  let reason: string;
+  try {
+    const res = await fetch(chrome.runtime.getURL('daemon-token.json'));
+    const body = res.ok ? await res.json() as { token?: unknown } : null;
+    const token = typeof body?.token === 'string' ? body.token.trim() : '';
+    if (DAEMON_TOKEN_RE.test(token)) {
+      daemonTokenProblemLogged = false;
+      return token;
+    }
+    reason = res.ok ? 'has no valid "token" (need >= 32 chars of [A-Za-z0-9_-])' : `is missing (HTTP ${res.status})`;
+  } catch {
+    reason = 'is missing or not valid JSON';
+  }
+  if (!daemonTokenProblemLogged) {
+    daemonTokenProblemLogged = true;
+    console.warn(`[opencli] daemon-token.json ${reason}; not connecting to the daemon. Reinstall the extension with its daemon token.`);
+  }
+  return null;
+}
+
 function isDaemonSocketActive(socket: WebSocket | null | undefined = ws): boolean {
   return socket?.readyState === WebSocket.OPEN || socket?.readyState === WebSocket.CONNECTING;
 }
@@ -139,6 +169,13 @@ function connect(): Promise<void> {
 async function connectAttempt(): Promise<void> {
   if (isDaemonSocketActive()) return;
 
+  const token = await loadDaemonToken();
+  if (!token) {
+    scheduleReconnect();
+    return; // keep polling so a later-installed token file is picked up
+  }
+  if (isDaemonSocketActive()) return;
+
   try {
     // omit credentials so the browser doesn't attach the localhost cookie jar —
     // a large jar can push the request past Node's default header limit and make
@@ -167,7 +204,7 @@ async function connectAttempt(): Promise<void> {
   try {
     const contextId = await getCurrentContextId();
     if (isDaemonSocketActive()) return;
-    thisWs = new WebSocket(DAEMON_WS_URL);
+    thisWs = new WebSocket(`${DAEMON_WS_URL}?token=${encodeURIComponent(token)}`);
     ws = thisWs;
     currentContextId = contextId;
   } catch {
@@ -1312,9 +1349,11 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
  */
 async function fetchDaemonVersion(): Promise<string | null> {
   try {
+    const token = await loadDaemonToken();
+    if (!token) return null;
     const res = await fetch(`http://${DAEMON_HOST}:${DAEMON_PORT}/status`, {
       method: 'GET',
-      headers: { 'X-OpenCLI': '1' },
+      headers: { 'X-OpenCLI': '1', Authorization: `Bearer ${token}` },
       signal: AbortSignal.timeout(1500),
     });
     if (!res.ok) return null;

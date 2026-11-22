@@ -13,6 +13,9 @@
  *      Browser Bridge extension origin so the extension can probe daemon reachability
  *   4. Body size limit — 1 MB max to prevent OOM
  *   5. WebSocket verifyClient — reject upgrade before connection is established
+ *   6. Shared-secret token (daemon-auth.ts) — every HTTP endpoint except /ping
+ *      needs `Authorization: Bearer <token>`; the /ext upgrade needs `?token=`.
+ *      Stops other local processes/users from driving the browser.
  *
  * Lifecycle:
  *   - Auto-spawned by opencli on first browser command
@@ -26,6 +29,7 @@ import { WebSocketServer, WebSocket, type RawData } from 'ws';
 import { DAEMON_HOST, DEFAULT_DAEMON_PORT, isIgnorableDaemonPortEnv, unsupportedDaemonPortEnvMessage } from './constants.js';
 import { EXIT_CODES } from './errors.js';
 import { log } from './logger.js';
+import { ensureDaemonToken, isAuthorizedExtUpgrade, isAuthorizedRequest } from './daemon-auth.js';
 import { PKG_VERSION } from './version.js';
 import { DEFAULT_CONTEXT_ID } from './browser/profile.js';
 import { recordExtensionVersion } from './update-check.js';
@@ -50,6 +54,14 @@ const PORT = DEFAULT_DAEMON_PORT;
 if (!isIgnorableDaemonPortEnv(process.env.OPENCLI_DAEMON_PORT)) {
   log.error(unsupportedDaemonPortEnvMessage(process.env.OPENCLI_DAEMON_PORT));
   process.exit(EXIT_CODES.USAGE_ERROR);
+}
+
+let DAEMON_TOKEN: string;
+try {
+  DAEMON_TOKEN = ensureDaemonToken();
+} catch (err) {
+  log.error(`[daemon] Refusing to start: ${err instanceof Error ? err.message : String(err)}`);
+  process.exit(EXIT_CODES.CONFIG_ERROR);
 }
 
 // ─── State ───────────────────────────────────────────────────────────
@@ -293,6 +305,12 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
   // is an accepted risk given the daemon is loopback-only and short-lived.
   if (req.method === 'GET' && pathname === '/ping') {
     jsonResponse(res, 200, { ok: true }, getResponseCorsHeaders(pathname, origin));
+    return;
+  }
+
+  // Every other endpoint requires the shared-secret bearer token.
+  if (!isAuthorizedRequest(req, DAEMON_TOKEN)) {
+    jsonResponse(res, 401, { ok: false, error: 'Unauthorized' });
     return;
   }
 
@@ -557,9 +575,9 @@ const wss = new WebSocketServer({
     // Block browser-originated WebSocket connections.  Browsers don't
     // enforce CORS on WebSocket, so a malicious webpage could connect to
     // ws://localhost:19825/ext and impersonate the Extension.  Real Chrome
-    // Extensions send origin chrome-extension://<id>.
-    const origin = req.headers['origin'] as string | undefined;
-    return !origin || origin.startsWith('chrome-extension://');
+    // Extensions send origin chrome-extension://<id>.  The upgrade must also
+    // carry ?token=<shared secret> (never log req.url: it contains the token).
+    return isAuthorizedExtUpgrade(req, DAEMON_TOKEN);
   },
 });
 

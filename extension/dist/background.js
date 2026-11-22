@@ -1003,6 +1003,28 @@ console.error = (...args) => {
   _origError(...args);
   forwardLog("error", args);
 };
+const DAEMON_TOKEN_RE = /^[A-Za-z0-9_-]{32,}$/;
+let daemonTokenProblemLogged = false;
+async function loadDaemonToken() {
+  let reason;
+  try {
+    const res = await fetch(chrome.runtime.getURL("daemon-token.json"));
+    const body = res.ok ? await res.json() : null;
+    const token = typeof body?.token === "string" ? body.token.trim() : "";
+    if (DAEMON_TOKEN_RE.test(token)) {
+      daemonTokenProblemLogged = false;
+      return token;
+    }
+    reason = res.ok ? 'has no valid "token" (need >= 32 chars of [A-Za-z0-9_-])' : `is missing (HTTP ${res.status})`;
+  } catch {
+    reason = "is missing or not valid JSON";
+  }
+  if (!daemonTokenProblemLogged) {
+    daemonTokenProblemLogged = true;
+    console.warn(`[opencli] daemon-token.json ${reason}; not connecting to the daemon. Reinstall the extension with its daemon token.`);
+  }
+  return null;
+}
 function isDaemonSocketActive(socket = ws) {
   return socket?.readyState === WebSocket.OPEN || socket?.readyState === WebSocket.CONNECTING;
 }
@@ -1016,6 +1038,12 @@ function connect() {
   return connectInFlight;
 }
 async function connectAttempt() {
+  if (isDaemonSocketActive()) return;
+  const token = await loadDaemonToken();
+  if (!token) {
+    scheduleReconnect();
+    return;
+  }
   if (isDaemonSocketActive()) return;
   try {
     const res = await fetch(DAEMON_PING_URL, {
@@ -1037,7 +1065,7 @@ async function connectAttempt() {
   try {
     const contextId = await getCurrentContextId();
     if (isDaemonSocketActive()) return;
-    thisWs = new WebSocket(DAEMON_WS_URL);
+    thisWs = new WebSocket(`${DAEMON_WS_URL}?token=${encodeURIComponent(token)}`);
     ws = thisWs;
     currentContextId = contextId;
   } catch {
@@ -1839,9 +1867,11 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 });
 async function fetchDaemonVersion() {
   try {
+    const token = await loadDaemonToken();
+    if (!token) return null;
     const res = await fetch(`http://${DAEMON_HOST}:${DAEMON_PORT}/status`, {
       method: "GET",
-      headers: { "X-OpenCLI": "1" },
+      headers: { "X-OpenCLI": "1", Authorization: `Bearer ${token}` },
       signal: AbortSignal.timeout(1500)
     });
     if (!res.ok) return null;

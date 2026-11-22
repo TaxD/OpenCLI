@@ -25,3 +25,6 @@ docs/.vitepress/cache
 *.db
 autoresearch/results/
 autoresearch-results.tsv
+
+# Per-install daemon secret written by the installer (never commit)
+extension/daemon-token.json

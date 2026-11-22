@@ -1,6 +1,6 @@
 {
   "name": "@jackwener/opencli",
-  "version": "2.0.3",
+  "version": "2.0.3-reach.1",
   "publishConfig": {
     "access": "public",
     "provenance": true
@@ -50,7 +50,7 @@
     "clean-dist": "node scripts/clean-dist.cjs",
     "start": "node dist/src/main.js",
     "start:bun": "bun dist/src/main.js",
-    "preuninstall": "node -e \"fetch('http://127.0.0.1:19825/shutdown',{method:'POST',headers:{'X-OpenCLI':'1'},signal:AbortSignal.timeout(3000)}).catch(()=>{})\" || true",
+    "preuninstall": "node -e \"let a={};try{const f=process.env.OPENCLI_DAEMON_TOKEN_FILE||require('path').join(require('os').homedir(),'.opencli','daemon-token');a={Authorization:'Bearer '+require('fs').readFileSync(f,'utf8').trim()}}catch{}fetch('http://127.0.0.1:19825/shutdown',{method:'POST',headers:{'X-OpenCLI':'1',...a},signal:AbortSignal.timeout(3000)}).catch(()=>{})\" || true",
     "postinstall": "node scripts/postinstall.js || true; node scripts/fetch-adapters.js || true",
     "typecheck": "tsc --noEmit",
     "prepare": "node scripts/prepare.cjs",

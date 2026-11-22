@@ -1,3 +1,5 @@
+import { daemonTokenPath, readDaemonTokenOrNull } from '../daemon-auth.js';
+import { BrowserConnectError } from '../errors.js';
 import { DAEMON_HOST, DEFAULT_DAEMON_PORT, isIgnorableDaemonPortEnv, unsupportedDaemonPortEnvMessage } from '../constants.js';
 
 const DAEMON_PORT = DEFAULT_DAEMON_PORT;
@@ -50,6 +52,12 @@ export type DaemonHealth =
   | { state: 'profile-disconnected'; status: DaemonStatus }
   | { state: 'ready'; status: DaemonStatus };
 
+/** Re-read per request: the daemon may create the token file after the CLI started. */
+function authHeader(): Record<string, string> {
+  const token = readDaemonTokenOrNull();
+  return token ? { Authorization: `Bearer ${token}` } : {};
+}
+
 export async function requestDaemon(pathname: string, init?: RequestInit & { timeout?: number }): Promise<Response> {
   assertSupportedDaemonPortEnv();
   const { timeout = 2000, headers, ...rest } = init ?? {};
@@ -58,7 +66,7 @@ export async function requestDaemon(pathname: string, init?: RequestInit & { tim
   try {
     return await fetch(`${DAEMON_URL}${pathname}`, {
       ...rest,
-      headers: { ...OPENCLI_HEADERS, ...headers },
+      headers: { ...OPENCLI_HEADERS, ...authHeader(), ...headers },
       signal: controller.signal,
     });
   } finally {
@@ -73,10 +81,21 @@ export async function fetchDaemonStatus(opts?: { timeout?: number; contextId?: s
       ...(opts?.preferredContextId ? { preferredContextId: opts.preferredContextId } : {}),
     }).toString();
     const res = await requestDaemon(`/status${query ? `?${query}` : ''}`, { timeout: opts?.timeout ?? 2000 });
+    // A running daemon that rejects us is not "stopped" — spawning another
+    // would only hit EADDRINUSE. Say why instead.
+    if (res.status === 401) {
+      throw new BrowserConnectError(
+        'opencli daemon rejected the request (Unauthorized)',
+        `The CLI could not authenticate with the daemon token at ${daemonTokenPath()}. ` +
+        'Make sure the file exists, is owned by you with mode 600, and matches the running daemon ' +
+        '(set OPENCLI_DAEMON_TOKEN_FILE consistently).',
+        'daemon-not-running',
+      );
+    }
     if (!res.ok) return null;
     return await res.json() as DaemonStatus;
   } catch (err) {
-    if (err instanceof UnsupportedDaemonPortEnvError) throw err;
+    if (err instanceof UnsupportedDaemonPortEnvError || err instanceof BrowserConnectError) throw err;
     return null;
   }
 }

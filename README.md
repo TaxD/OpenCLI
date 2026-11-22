@@ -1,5 +1,13 @@
 # OpenCLI
 
+> [!IMPORTANT]
+> **Fork note (`2.0.3-reach.1`): this fork adds token authentication to the local daemon.**
+> Upstream only checks `Origin` and an `X-OpenCLI: 1` header, so any local process could drive the browser through `127.0.0.1:19825`. Here every daemon endpoint except `GET /ping` requires `Authorization: Bearer <token>`, and the extension's `ws://127.0.0.1:19825/ext` upgrade requires `?token=<token>`.
+>
+> - **Token file:** `~/.opencli/daemon-token` (override with `OPENCLI_DAEMON_TOKEN_FILE`). The daemon creates it on first start (32 random bytes, hex; directory `0700`, file `0600`) and refuses to start if the file is a symlink, not a regular file, not owned by you, readable by group/others, or holds fewer than 32 `[A-Za-z0-9_-]` characters. The CLI only reads it; without it, requests get `401`.
+> - **Extension:** put `daemon-token.json` (`{ "token": "<same token>" }`) next to the extension's `manifest.json`. The installer writes it; it is git-ignored and not web-accessible. Without a valid file the extension does not connect and logs one warning in its service-worker console.
+> - An upstream (unpatched) CLI or extension cannot talk to this daemon: it gets `401` / a rejected WebSocket upgrade. Use the `1.0.27.1` extension from this fork.
+
 > **Convert any website into a CLI & run Browser Use on your logged-in Chrome.**
 > Turn websites and browser sessions into deterministic interfaces for humans and AI agents.
 > Or run Browser Use against any page — navigate, fill forms, click, extract, automate.

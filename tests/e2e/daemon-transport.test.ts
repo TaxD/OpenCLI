@@ -23,6 +23,8 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { spawn, type ChildProcess } from 'node:child_process';
 import { createConnection, createServer } from 'node:net';
+import * as fs from 'node:fs';
+import * as os from 'node:os';
 import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import WebSocket from 'ws';
@@ -32,7 +34,11 @@ const ROOT = path.resolve(__dirname, '../..');
 const DAEMON_ENTRY = path.join(ROOT, 'dist', 'src', 'daemon.js');
 const PORT = 19825;
 const BASE = `http://127.0.0.1:${PORT}`;
-const HEADERS = { 'X-OpenCLI': '1', 'Content-Type': 'application/json' };
+// Pre-seeded 0600 token file handed to the daemon via OPENCLI_DAEMON_TOKEN_FILE.
+const TOKEN = 'e2e'.repeat(22);
+const TOKEN_FILE = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'opencli-e2e-')), 'daemon-token');
+fs.writeFileSync(TOKEN_FILE, TOKEN, { mode: 0o600 });
+const HEADERS = { 'X-OpenCLI': '1', 'Content-Type': 'application/json', Authorization: `Bearer ${TOKEN}` };
 
 type WireResult = {
   id?: string;
@@ -55,7 +61,7 @@ class FakeExtension {
   });
 
   async connect(contextId: string, version = '1.0.22', host = '127.0.0.1'): Promise<void> {
-    const ws = new WebSocket(`ws://${host}:${PORT}/ext`, {
+    const ws = new WebSocket(`ws://${host}:${PORT}/ext?token=${TOKEN}`, {
       headers: { origin: 'chrome-extension://e2e-fake-extension' },
     });
     this.ws = ws;
@@ -159,7 +165,10 @@ describe('daemon transport contracts (real daemon)', () => {
       if (process.env.CI === 'true') throw new Error(skipReason);
       return;
     }
-    daemon = spawn(process.execPath, [DAEMON_ENTRY], { stdio: ['ignore', 'ignore', 'pipe'] });
+    daemon = spawn(process.execPath, [DAEMON_ENTRY], {
+      stdio: ['ignore', 'ignore', 'pipe'],
+      env: { ...process.env, OPENCLI_DAEMON_TOKEN_FILE: TOKEN_FILE },
+    });
     let stderr = '';
     daemon.stderr?.on('data', (chunk) => { stderr += chunk.toString(); });
     try {
@@ -326,6 +335,26 @@ describe('daemon transport contracts (real daemon)', () => {
       first.close();
       second.close();
     }
+  });
+
+  it('requires the shared token on every endpoint except /ping and on the /ext upgrade', async () => {
+    if (guard()) return;
+    const noAuth = { 'X-OpenCLI': '1' };
+    const ping = await fetch(`${BASE}/ping`, { signal: AbortSignal.timeout(2_000) });
+    expect(await ping.json()).toEqual({ ok: true });
+    for (const [method, p] of [['GET', '/status'], ['GET', '/logs'], ['DELETE', '/logs'], ['POST', '/command'], ['POST', '/shutdown'], ['GET', '/nope']]) {
+      const res = await fetch(`${BASE}${p}`, { method, headers: noAuth, signal: AbortSignal.timeout(2_000) });
+      expect(res.status, `${method} ${p}`).toBe(401);
+      expect(await res.json()).toEqual({ ok: false, error: 'Unauthorized' });
+      const wrong = await fetch(`${BASE}${p}`, { method, headers: { ...noAuth, Authorization: `Bearer ${'x'.repeat(66)}` }, signal: AbortSignal.timeout(2_000) });
+      expect(wrong.status, `${method} ${p} wrong token`).toBe(401);
+    }
+    const outcome = await new Promise<string>((resolve) => {
+      const ws = new WebSocket(`ws://127.0.0.1:${PORT}/ext`, { headers: { origin: 'chrome-extension://e2e-fake-extension' } });
+      ws.once('open', () => { ws.close(); resolve('open'); });
+      ws.once('error', () => resolve('rejected'));
+    });
+    expect(outcome).toBe('rejected');
   });
 
   it('accepts a legacy localhost extension on [::1] into the same daemon (#2690)', async () => {
