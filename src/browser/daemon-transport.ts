@@ -1,4 +1,4 @@
-import { daemonTokenPath, readDaemonTokenOrNull } from '../daemon-auth.js';
+import { authorizationHeader, daemonTokenPath, readDaemonTokenOrNull, signParts } from '../daemon-auth.js';
 import { BrowserConnectError } from '../errors.js';
 import { DAEMON_HOST, DEFAULT_DAEMON_PORT, isIgnorableDaemonPortEnv, unsupportedDaemonPortEnvMessage } from '../constants.js';
 
@@ -52,10 +52,18 @@ export type DaemonHealth =
   | { state: 'profile-disconnected'; status: DaemonStatus }
   | { state: 'ready'; status: DaemonStatus };
 
-/** Re-read per request: the daemon may create the token file after the CLI started. */
-function authHeader(): Record<string, string> {
+/**
+ * HMAC signature over method, the exact path+query fetch will send, and the
+ * body hash; the token itself never leaves this process. Re-read per request:
+ * the daemon may create the token file after the CLI started.
+ */
+function authHeader(method: string, url: URL, body: RequestInit['body']): Record<string, string> {
   const token = readDaemonTokenOrNull();
-  return token ? { Authorization: `Bearer ${token}` } : {};
+  if (!token) return {};
+  if (body != null && typeof body !== 'string' && !(body instanceof Uint8Array)) {
+    throw new TypeError('requestDaemon only supports string or Uint8Array bodies');
+  }
+  return { Authorization: authorizationHeader(signParts(token, method, url.pathname + url.search, body ?? undefined)) };
 }
 
 export async function requestDaemon(pathname: string, init?: RequestInit & { timeout?: number }): Promise<Response> {
@@ -64,9 +72,10 @@ export async function requestDaemon(pathname: string, init?: RequestInit & { tim
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeout);
   try {
-    return await fetch(`${DAEMON_URL}${pathname}`, {
+    const url = new URL(`${DAEMON_URL}${pathname}`);
+    return await fetch(url.href, {
       ...rest,
-      headers: { ...OPENCLI_HEADERS, ...authHeader(), ...headers },
+      headers: { ...OPENCLI_HEADERS, ...authHeader(rest.method ?? 'GET', url, rest.body), ...headers },
       signal: controller.signal,
     });
   } finally {

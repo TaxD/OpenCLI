@@ -4,7 +4,8 @@
  *
  * The token lives in a 0600 file (default ~/.opencli/daemon-token, override
  * with OPENCLI_DAEMON_TOKEN_FILE). The daemon creates it on first start; the
- * CLI only reads it. Token values never appear in logs or error messages.
+ * CLI only reads it. The token itself is never sent over the wire (requests
+ * are HMAC-signed, see below) and never appears in logs or error messages.
  */
 
 import * as crypto from 'node:crypto';
@@ -94,33 +95,116 @@ export function readDaemonTokenOrNull(): string | null {
   }
 }
 
-export function tokensMatch(expected: string, provided: unknown): boolean {
-  if (typeof provided !== 'string') return false;
-  const a = Buffer.from(expected, 'utf-8');
-  const b = Buffer.from(provided, 'utf-8');
-  return a.length === b.length && crypto.timingSafeEqual(a, b);
+// ─── Signed-request protocol ─────────────────────────────────────────
+// The token is never sent. Requests carry an HMAC-SHA256 signature keyed by
+// the token's UTF-8 bytes; the daemon proves its identity by answering a
+// nonce challenge with HMAC(key, "opencli-daemon-proof\n" + nonce).
+
+export const AUTH_SCHEME = 'OpenCLI-HMAC';
+export const MAX_CLOCK_SKEW_MS = 30_000;
+export const NONCE_TTL_MS = 60_000;
+const NONCE_RE = /^[0-9a-f]{32}$/;
+const SIG_RE = /^[0-9a-f]{64}$/;
+const TS_RE = /^\d{1,16}$/;
+export const PROOF_NONCE_RE = /^[0-9a-f]{32,128}$/;
+
+export interface SignatureParts { ts: string; nonce: string; sig: string }
+
+const hmacHex = (token: string, data: string): string =>
+  crypto.createHmac('sha256', Buffer.from(token, 'utf-8')).update(data, 'utf-8').digest('hex');
+
+export function sha256Hex(body: string | Uint8Array = ''): string {
+  return crypto.createHash('sha256').update(body).digest('hex');
 }
 
-/** HTTP: `Authorization: Bearer <token>`. */
-export function isAuthorizedRequest(req: IncomingMessage, token: string): boolean {
-  const header = req.headers['authorization'];
-  if (typeof header !== 'string') return false;
-  const match = /^Bearer ([^\s]+)$/.exec(header.trim());
-  return !!match && tokensMatch(token, match[1]);
+export function computeSignature(
+  token: string, method: string, pathAndQuery: string, ts: string, nonce: string, bodySha256Hex: string,
+): string {
+  return hmacHex(token, [method.toUpperCase(), pathAndQuery, ts, nonce, bodySha256Hex].join('\n'));
+}
+
+export function daemonProof(token: string, nonce: string): string {
+  return hmacHex(token, `opencli-daemon-proof\n${nonce}`);
+}
+
+export function newNonce(): string {
+  return crypto.randomBytes(16).toString('hex');
+}
+
+/** Fresh ts/nonce/sig for one request. `pathAndQuery` must be exactly what goes on the wire. */
+export function signParts(token: string, method: string, pathAndQuery: string, body?: string | Uint8Array): SignatureParts {
+  const ts = String(Date.now());
+  const nonce = newNonce();
+  return { ts, nonce, sig: computeSignature(token, method, pathAndQuery, ts, nonce, sha256Hex(body ?? '')) };
+}
+
+export function authorizationHeader(parts: SignatureParts): string {
+  return `${AUTH_SCHEME} ts=${parts.ts};nonce=${parts.nonce};sig=${parts.sig}`;
+}
+
+export function parseAuthorization(header: unknown): SignatureParts | null {
+  if (typeof header !== 'string') return null;
+  const m = /^OpenCLI-HMAC ts=([^;\s]+);nonce=([^;\s]+);sig=([^;\s]+)$/.exec(header.trim());
+  return m ? { ts: m[1], nonce: m[2], sig: m[3] } : null;
+}
+
+/**
+ * Remembers nonces for NONCE_TTL_MS. Fails closed when full so an attacker
+ * cannot flush a nonce out of the cache and replay it inside the window.
+ */
+export class NonceCache {
+  private readonly seen = new Map<string, number>();
+  constructor(private readonly maxEntries = 10_000, private readonly ttlMs = NONCE_TTL_MS) {}
+
+  /** True when the nonce is new (and records it); false on replay or overflow. */
+  claim(nonce: string, now = Date.now()): boolean {
+    for (const [n, expiry] of this.seen) {
+      if (expiry > now) break; // insertion order ≈ expiry order
+      this.seen.delete(n);
+    }
+    if (this.seen.has(nonce) || this.seen.size >= this.maxEntries) return false;
+    this.seen.set(nonce, now + this.ttlMs);
+    return true;
+  }
+}
+
+/** Validate a signature: format, clock skew, timing-safe compare, then nonce single use. */
+export function verifySignature(
+  token: string,
+  parts: Partial<SignatureParts> | null,
+  method: string,
+  pathAndQuery: string,
+  body: string | Uint8Array,
+  nonces: NonceCache,
+  now = Date.now(),
+): boolean {
+  if (!parts || typeof parts.ts !== 'string' || typeof parts.nonce !== 'string' || typeof parts.sig !== 'string') return false;
+  if (!TS_RE.test(parts.ts) || !NONCE_RE.test(parts.nonce) || !SIG_RE.test(parts.sig)) return false;
+  if (Math.abs(now - Number(parts.ts)) > MAX_CLOCK_SKEW_MS) return false;
+  const expected = Buffer.from(computeSignature(token, method, pathAndQuery, parts.ts, parts.nonce, sha256Hex(body)), 'utf-8');
+  const provided = Buffer.from(parts.sig, 'utf-8');
+  if (expected.length !== provided.length || !crypto.timingSafeEqual(expected, provided)) return false;
+  return nonces.claim(parts.nonce, now);
+}
+
+/** HTTP request (body already read). Signs METHOD + raw request target. */
+export function isAuthorizedRequest(req: IncomingMessage, body: string | Uint8Array, token: string, nonces: NonceCache): boolean {
+  return verifySignature(token, parseAuthorization(req.headers['authorization']), req.method ?? '', req.url ?? '/', body, nonces);
 }
 
 /**
  * WebSocket `/ext` upgrade: Origin must be absent or chrome-extension://, and
- * `?token=<token>` must match (browser WebSocket cannot set headers).
+ * the query must carry ts/nonce/sig over ("GET", "/ext", empty body).
  */
-export function isAuthorizedExtUpgrade(req: IncomingMessage, token: string): boolean {
+export function isAuthorizedExtUpgrade(req: IncomingMessage, token: string, nonces: NonceCache): boolean {
   const origin = req.headers['origin'];
   if (origin && !origin.startsWith('chrome-extension://')) return false;
-  let provided: string | null;
+  let params: URLSearchParams;
   try {
-    provided = new URL(req.url ?? '/', 'http://127.0.0.1').searchParams.get('token');
+    params = new URL(req.url ?? '/', 'http://127.0.0.1').searchParams;
   } catch {
     return false;
   }
-  return tokensMatch(token, provided);
+  const parts = { ts: params.get('ts') ?? undefined, nonce: params.get('nonce') ?? undefined, sig: params.get('sig') ?? undefined };
+  return verifySignature(token, parts, 'GET', '/ext', '', nonces);
 }

@@ -12,12 +12,15 @@ import {
   setDaemonRunContext,
 } from './daemon-client.js';
 import { BrowserConnectError, SessionBusyError } from '../errors.js';
+import { createHash, createHmac } from 'node:crypto';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import * as daemonLifecycle from './daemon-lifecycle.js';
+import { requestDaemon } from './daemon-transport.js';
 
 const TEST_TOKEN = 't'.repeat(64);
+const SIGNED = /^OpenCLI-HMAC ts=\d+;nonce=[0-9a-f]{32};sig=[0-9a-f]{64}$/;
 
 /** Point the CLI at a throwaway 0600 token file instead of ~/.opencli/daemon-token. */
 function useTestTokenFile(): void {
@@ -60,9 +63,32 @@ describe('daemon-client', () => {
     expect(fetchMock).toHaveBeenCalledWith(
       expect.stringMatching(/\/status$/),
       expect.objectContaining({
-        headers: expect.objectContaining({ 'X-OpenCLI': '1', Authorization: `Bearer ${TEST_TOKEN}` }),
+        headers: expect.objectContaining({ 'X-OpenCLI': '1', Authorization: expect.stringMatching(SIGNED) }),
       }),
     );
+  });
+
+  it('signs method, exact path+query and body hash with HMAC and never sends the token itself', async () => {
+    const fetchMock = vi.mocked(fetch);
+    fetchMock.mockResolvedValue({ ok: true, json: () => Promise.resolve({ id: 'x', ok: true }) } as Response);
+    const body = JSON.stringify({ id: 'x', action: 'lease-release' });
+    await requestDaemon('/status?contextId=a b&preferredContextId=c', { timeout: 1000 });
+    await requestDaemon('/command', { method: 'POST', body, timeout: 1000 });
+
+    const check = (call: unknown[], method: string, target: string, sentBody: string) => {
+      const [url, init] = call as [string, RequestInit];
+      const u = new URL(url);
+      expect(u.pathname + u.search).toBe(target);
+      const auth = (init.headers as Record<string, string>).Authorization;
+      const [, ts, nonce, sig] = /^OpenCLI-HMAC ts=(\d+);nonce=([0-9a-f]{32});sig=([0-9a-f]{64})$/.exec(auth)!;
+      const expected = createHmac('sha256', TEST_TOKEN)
+        .update([method, target, ts, nonce, createHash('sha256').update(sentBody).digest('hex')].join('\n'))
+        .digest('hex');
+      expect(sig).toBe(expected);
+    };
+    check(fetchMock.mock.calls[0], 'GET', '/status?contextId=a%20b&preferredContextId=c', '');
+    check(fetchMock.mock.calls[1], 'POST', '/command', body);
+    expect(JSON.stringify(fetchMock.mock.calls)).not.toContain(TEST_TOKEN);
   });
 
   it('omits Authorization when the token file is missing', async () => {
@@ -96,7 +122,7 @@ describe('daemon-client', () => {
       expect.stringMatching(/\/shutdown$/),
       expect.objectContaining({
         method: 'POST',
-        headers: expect.objectContaining({ 'X-OpenCLI': '1', Authorization: `Bearer ${TEST_TOKEN}` }),
+        headers: expect.objectContaining({ 'X-OpenCLI': '1', Authorization: expect.stringMatching(SIGNED) }),
       }),
     );
   });

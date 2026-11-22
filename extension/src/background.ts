@@ -14,6 +14,7 @@ import { findIdleInteractiveGroup, idlePlaceholderUrl, parkIdleInteractiveTab, c
 import * as executor from './cdp';
 import * as identity from './identity';
 import { executeWithJournal } from './journal';
+import { authorizationHeader, constantTimeEqual, expectedDaemonProof, importDaemonKey, randomNonce, signParts } from './daemon-auth';
 
 let ws: WebSocket | null = null;
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
@@ -93,8 +94,12 @@ function forwardLog(level: 'info' | 'warn' | 'error', args: unknown[]): void {
   } catch { /* don't recurse */ }
 }
 
+/** Sockets whose daemon answered our identity challenge. Nothing else is sent before that. */
+const verifiedSockets = new WeakSet<WebSocket>();
+const DAEMON_PROOF_TIMEOUT_MS = 5000;
+
 function safeSend(socket: WebSocket | null | undefined, payload: unknown): boolean {
-  if (!socket || socket.readyState !== WebSocket.OPEN) return false;
+  if (!socket || socket.readyState !== WebSocket.OPEN || !verifiedSockets.has(socket)) return false;
   try {
     socket.send(JSON.stringify(payload));
     return true;
@@ -113,7 +118,8 @@ console.error = (...args: unknown[]) => { _origError(...args); forwardLog('error
  * Shared secret for the local daemon, written next to manifest.json by the
  * installer as daemon-token.json ({ "token": "..." }). Not web-accessible, so
  * pages and other extensions cannot read it. Re-read on every connect attempt
- * (never persisted to chrome.storage) so a rotated token is picked up.
+ * (never persisted to chrome.storage) so a rotated token is picked up. The
+ * token is only used as an HMAC key; it is never sent to the daemon.
  */
 const DAEMON_TOKEN_RE = /^[A-Za-z0-9_-]{32,}$/;
 let daemonTokenProblemLogged = false;
@@ -175,12 +181,20 @@ async function connectAttempt(): Promise<void> {
     return; // keep polling so a later-installed token file is picked up
   }
   if (isDaemonSocketActive()) return;
+  let key: CryptoKey;
+  try {
+    key = await importDaemonKey(token);
+  } catch {
+    scheduleReconnect();
+    return;
+  }
 
   try {
     // omit credentials so the browser doesn't attach the localhost cookie jar —
     // a large jar can push the request past Node's default header limit and make
     // the daemon answer 431, silently wedging the connect loop forever.
-    const res = await fetch(DAEMON_PING_URL, {
+    const pingNonce = randomNonce();
+    const res = await fetch(`${DAEMON_PING_URL}?nonce=${pingNonce}`, {
       signal: AbortSignal.timeout(1000),
       credentials: 'omit',
     });
@@ -189,7 +203,14 @@ async function connectAttempt(): Promise<void> {
       scheduleReconnect();
       return; // unexpected response — not our daemon, but keep polling.
     }
-    // Daemon is reachable — proceed straight to the WebSocket below.
+    // Only a process holding the token can answer the nonce.
+    const body = await res.json().catch(() => null) as { proof?: unknown } | null;
+    if (typeof body?.proof !== 'string' || !constantTimeEqual(body.proof, await expectedDaemonProof(key, pingNonce))) {
+      console.warn('[opencli] process on the daemon port failed the identity proof; not connecting');
+      scheduleReconnect();
+      return;
+    }
+    // Verified daemon is reachable — proceed straight to the WebSocket below.
     reconnectAttempts = 0;
   } catch {
     // Daemon not running is the expected idle state — keep the probe silent to
@@ -204,7 +225,9 @@ async function connectAttempt(): Promise<void> {
   try {
     const contextId = await getCurrentContextId();
     if (isDaemonSocketActive()) return;
-    thisWs = new WebSocket(`${DAEMON_WS_URL}?token=${encodeURIComponent(token)}`);
+    const sig = await signParts(key, 'GET', '/ext');
+    if (isDaemonSocketActive()) return;
+    thisWs = new WebSocket(`${DAEMON_WS_URL}?ts=${sig.ts}&nonce=${sig.nonce}&sig=${sig.sig}`);
     ws = thisWs;
     currentContextId = contextId;
   } catch {
@@ -212,8 +235,33 @@ async function connectAttempt(): Promise<void> {
     return;
   }
 
+  // Identity challenge: until the daemon answers with HMAC(key, nonce) we send
+  // nothing (no hello, logs or results) and act on nothing it sends.
+  let challenge: string | null = null;
+  let proofTimer: ReturnType<typeof setTimeout> | null = null;
+  const rejectDaemon = (why: string) => {
+    if (proofTimer) clearTimeout(proofTimer);
+    proofTimer = null;
+    challenge = null;
+    console.warn(`[opencli] ${why}; closing daemon connection`);
+    thisWs.close();
+  };
+
   thisWs.onopen = () => {
     if (ws !== thisWs) return;
+    challenge = randomNonce();
+    try {
+      thisWs.send(JSON.stringify({ type: 'daemon-challenge', nonce: challenge }));
+    } catch {
+      thisWs.close();
+      return;
+    }
+    proofTimer = setTimeout(() => {
+      if (!verifiedSockets.has(thisWs)) rejectDaemon('daemon did not prove its identity in time');
+    }, DAEMON_PROOF_TIMEOUT_MS);
+  };
+
+  const onDaemonVerified = () => {
     console.log('[opencli] Connected to daemon');
     reconnectAttempts = 0; // Reset on successful connection
     if (reconnectTimer) {
@@ -236,13 +284,33 @@ async function connectAttempt(): Promise<void> {
 
   thisWs.onmessage = async (event) => {
     if (ws !== thisWs) return;
+    if (!verifiedSockets.has(thisWs)) {
+      const nonce = challenge;
+      challenge = null; // one answer per challenge
+      let proof: unknown;
+      try {
+        const msg = JSON.parse(event.data as string) as { type?: unknown; proof?: unknown };
+        if (msg?.type === 'daemon-proof') proof = msg.proof;
+      } catch { /* treated as a failed proof */ }
+      const ok = !!nonce && typeof proof === 'string' && constantTimeEqual(proof, await expectedDaemonProof(key, nonce));
+      if (!ok) {
+        rejectDaemon('daemon failed the identity proof');
+        return;
+      }
+      if (proofTimer) clearTimeout(proofTimer);
+      proofTimer = null;
+      if (ws !== thisWs || thisWs.readyState !== WebSocket.OPEN) return;
+      verifiedSockets.add(thisWs);
+      onDaemonVerified();
+      return;
+    }
     try {
       const command = JSON.parse(event.data as string) as Command;
       const result = await executeWithJournal(command, handleCommand);
       // The socket may have been replaced while a long command ran. Deliver
       // the result on the freshest open socket — the daemon correlates by id,
       // and the journal replays it if this delivery is lost too.
-      const target = ws && ws.readyState === WebSocket.OPEN ? ws : thisWs;
+      const target = ws && ws.readyState === WebSocket.OPEN && verifiedSockets.has(ws) ? ws : thisWs;
       safeSend(target, result);
     } catch (err) {
       console.error('[opencli] Message handling error:', err);
@@ -250,6 +318,8 @@ async function connectAttempt(): Promise<void> {
   };
 
   thisWs.onclose = () => {
+    if (proofTimer) clearTimeout(proofTimer);
+    proofTimer = null;
     stopWsKeepalive(thisWs);
     if (ws !== thisWs) return;
     console.log('[opencli] Disconnected from daemon');
@@ -1351,9 +1421,10 @@ async function fetchDaemonVersion(): Promise<string | null> {
   try {
     const token = await loadDaemonToken();
     if (!token) return null;
+    const auth = authorizationHeader(await signParts(await importDaemonKey(token), 'GET', '/status'));
     const res = await fetch(`http://${DAEMON_HOST}:${DAEMON_PORT}/status`, {
       method: 'GET',
-      headers: { 'X-OpenCLI': '1', Authorization: `Bearer ${token}` },
+      headers: { 'X-OpenCLI': '1', Authorization: auth },
       signal: AbortSignal.timeout(1500),
     });
     if (!res.ok) return null;

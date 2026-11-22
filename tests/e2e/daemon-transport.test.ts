@@ -22,6 +22,7 @@
 
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { spawn, type ChildProcess } from 'node:child_process';
+import { createHash, createHmac, randomBytes } from 'node:crypto';
 import { createConnection, createServer } from 'node:net';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
@@ -38,7 +39,21 @@ const BASE = `http://127.0.0.1:${PORT}`;
 const TOKEN = 'e2e'.repeat(22);
 const TOKEN_FILE = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'opencli-e2e-')), 'daemon-token');
 fs.writeFileSync(TOKEN_FILE, TOKEN, { mode: 0o600 });
-const HEADERS = { 'X-OpenCLI': '1', 'Content-Type': 'application/json', Authorization: `Bearer ${TOKEN}` };
+const hmac = (data: string, key = TOKEN) => createHmac('sha256', key).update(data).digest('hex');
+const sha256 = (body: string) => createHash('sha256').update(body).digest('hex');
+/** ts/nonce/sig over [METHOD, target, ts, nonce, sha256(body)] — the token is never sent. */
+function sign(method: string, target: string, body = '', key = TOKEN, ts = String(Date.now())) {
+  const nonce = randomBytes(16).toString('hex');
+  return { ts, nonce, sig: hmac([method, target, ts, nonce, sha256(body)].join('\n'), key) };
+}
+function signedHeaders(method: string, target: string, body = ''): Record<string, string> {
+  const { ts, nonce, sig } = sign(method, target, body);
+  return { 'X-OpenCLI': '1', 'Content-Type': 'application/json', Authorization: `OpenCLI-HMAC ts=${ts};nonce=${nonce};sig=${sig}` };
+}
+const signedExtQuery = (key = TOKEN) => {
+  const { ts, nonce, sig } = sign('GET', '/ext', '', key);
+  return `?ts=${ts}&nonce=${nonce}&sig=${sig}`;
+};
 
 type WireResult = {
   id?: string;
@@ -61,7 +76,7 @@ class FakeExtension {
   });
 
   async connect(contextId: string, version = '1.0.22', host = '127.0.0.1'): Promise<void> {
-    const ws = new WebSocket(`ws://${host}:${PORT}/ext?token=${TOKEN}`, {
+    const ws = new WebSocket(`ws://${host}:${PORT}/ext${signedExtQuery()}`, {
       headers: { origin: 'chrome-extension://e2e-fake-extension' },
     });
     this.ws = ws;
@@ -106,7 +121,7 @@ class FakeExtension {
 
 async function getStatus(query = ''): Promise<any | null> {
   try {
-    const res = await fetch(`${BASE}/status${query}`, { headers: HEADERS, signal: AbortSignal.timeout(2_000) });
+    const res = await fetch(`${BASE}/status${query}`, { headers: signedHeaders('GET', `/status${query}`), signal: AbortSignal.timeout(2_000) });
     if (!res.ok) return null;
     return await res.json();
   } catch {
@@ -115,10 +130,11 @@ async function getStatus(query = ''): Promise<any | null> {
 }
 
 async function postCommand(body: Record<string, unknown>, timeoutMs = 15_000): Promise<{ status: number; result: WireResult }> {
+  const payload = JSON.stringify(body);
   const res = await fetch(`${BASE}/command`, {
     method: 'POST',
-    headers: HEADERS,
-    body: JSON.stringify(body),
+    headers: signedHeaders('POST', '/command', payload),
+    body: payload,
     signal: AbortSignal.timeout(timeoutMs),
   });
   return { status: res.status, result: (await res.json()) as WireResult };
@@ -181,7 +197,7 @@ describe('daemon transport contracts (real daemon)', () => {
   afterAll(async () => {
     if (!daemon) return;
     try {
-      await fetch(`${BASE}/shutdown`, { method: 'POST', headers: HEADERS, signal: AbortSignal.timeout(2_000) });
+      await fetch(`${BASE}/shutdown`, { method: 'POST', headers: signedHeaders('POST', '/shutdown'), signal: AbortSignal.timeout(2_000) });
     } catch { /* daemon may already be gone */ }
     await new Promise<void>((resolve) => {
       if (!daemon || daemon.exitCode !== null) return resolve();
@@ -337,24 +353,70 @@ describe('daemon transport contracts (real daemon)', () => {
     }
   });
 
-  it('requires the shared token on every endpoint except /ping and on the /ext upgrade', async () => {
+  it('rejects unsigned, stale, replayed and tampered requests on every endpoint except /ping', async () => {
     if (guard()) return;
     const noAuth = { 'X-OpenCLI': '1' };
     const ping = await fetch(`${BASE}/ping`, { signal: AbortSignal.timeout(2_000) });
     expect(await ping.json()).toEqual({ ok: true });
-    for (const [method, p] of [['GET', '/status'], ['GET', '/logs'], ['DELETE', '/logs'], ['POST', '/command'], ['POST', '/shutdown'], ['GET', '/nope']]) {
-      const res = await fetch(`${BASE}${p}`, { method, headers: noAuth, signal: AbortSignal.timeout(2_000) });
-      expect(res.status, `${method} ${p}`).toBe(401);
+    const auth = (p: { ts: string; nonce: string; sig: string }) => ({ ...noAuth, Authorization: `OpenCLI-HMAC ts=${p.ts};nonce=${p.nonce};sig=${p.sig}` });
+    const expect401 = async (method: string, target: string, headers: Record<string, string>, body?: string) => {
+      const res = await fetch(`${BASE}${target}`, { method, headers, body, signal: AbortSignal.timeout(2_000) });
+      expect(res.status, `${method} ${target}`).toBe(401);
       expect(await res.json()).toEqual({ ok: false, error: 'Unauthorized' });
-      const wrong = await fetch(`${BASE}${p}`, { method, headers: { ...noAuth, Authorization: `Bearer ${'x'.repeat(66)}` }, signal: AbortSignal.timeout(2_000) });
-      expect(wrong.status, `${method} ${p} wrong token`).toBe(401);
+    };
+    for (const [method, target] of [['GET', '/status'], ['GET', '/logs'], ['DELETE', '/logs'], ['POST', '/command'], ['POST', '/shutdown'], ['GET', '/nope']]) {
+      await expect401(method, target, noAuth);
+      await expect401(method, target, { ...noAuth, Authorization: `Bearer ${TOKEN}` });
+      await expect401(method, target, auth(sign(method, target, '', 'x'.repeat(64))));
     }
-    const outcome = await new Promise<string>((resolve) => {
-      const ws = new WebSocket(`ws://127.0.0.1:${PORT}/ext`, { headers: { origin: 'chrome-extension://e2e-fake-extension' } });
-      ws.once('open', () => { ws.close(); resolve('open'); });
-      ws.once('error', () => resolve('rejected'));
+    // clock skew beyond 30s either way
+    await expect401('GET', '/status', auth(sign('GET', '/status', '', TOKEN, String(Date.now() - 31_000))));
+    await expect401('GET', '/status', auth(sign('GET', '/status', '', TOKEN, String(Date.now() + 31_000))));
+    // path / query / body tampering
+    await expect401('GET', '/logs', auth(sign('GET', '/status')));
+    await expect401('GET', '/status?contextId=b', auth(sign('GET', '/status?contextId=a')));
+    const signedBody = JSON.stringify({ id: 'tamper', action: 'lease-release', runId: 'r' });
+    await expect401('POST', '/command', auth(sign('POST', '/command', signedBody)), JSON.stringify({ id: 'tamper2', action: 'lease-release', runId: 'r' }));
+    // nonce replay
+    const once = auth(sign('GET', '/status'));
+    expect((await fetch(`${BASE}/status`, { headers: once, signal: AbortSignal.timeout(2_000) })).status).toBe(200);
+    await expect401('GET', '/status', once);
+    // signed body round-trips
+    const ok = await postCommand({ id: 'signed-release', action: 'lease-release', runId: 'r' });
+    expect(ok).toEqual({ status: 200, result: { id: 'signed-release', ok: true } });
+  });
+
+  it('/ping?nonce= returns HMAC proof; a malformed nonce gets 400', async () => {
+    if (guard()) return;
+    const nonce = randomBytes(24).toString('hex');
+    const res = await fetch(`${BASE}/ping?nonce=${nonce}`, { signal: AbortSignal.timeout(2_000) });
+    expect(await res.json()).toEqual({ ok: true, proof: hmac(`opencli-daemon-proof\n${nonce}`) });
+    for (const bad of ['xyz', 'ab'.repeat(8), 'a'.repeat(130), 'AB'.repeat(16)]) {
+      expect((await fetch(`${BASE}/ping?nonce=${bad}`, { signal: AbortSignal.timeout(2_000) })).status, bad).toBe(400);
+    }
+  });
+
+  it('rejects an unsigned /ext upgrade and answers the daemon-challenge with the proof', async () => {
+    if (guard()) return;
+    const dial = (query: string) => new Promise<WebSocket | null>((resolve) => {
+      const ws = new WebSocket(`ws://127.0.0.1:${PORT}/ext${query}`, { headers: { origin: 'chrome-extension://e2e-fake-extension' } });
+      ws.once('open', () => resolve(ws));
+      ws.once('error', () => resolve(null));
     });
-    expect(outcome).toBe('rejected');
+    expect(await dial('')).toBeNull();
+    expect(await dial(`?token=${TOKEN}`)).toBeNull();
+    expect(await dial(signedExtQuery('x'.repeat(64)))).toBeNull();
+
+    const ws = await dial(signedExtQuery());
+    expect(ws).not.toBeNull();
+    try {
+      const nonce = randomBytes(16).toString('hex');
+      const reply = new Promise<any>((resolve) => ws!.once('message', (raw) => resolve(JSON.parse(raw.toString()))));
+      ws!.send(JSON.stringify({ type: 'daemon-challenge', nonce }));
+      expect(await reply).toEqual({ type: 'daemon-proof', proof: hmac(`opencli-daemon-proof\n${nonce}`) });
+    } finally {
+      ws!.close();
+    }
   });
 
   it('accepts a legacy localhost extension on [::1] into the same daemon (#2690)', async () => {
@@ -386,7 +448,7 @@ describe('daemon transport contracts (real daemon)', () => {
     const inflight = postCommand({ id, action: 'navigate', url: 'https://example.com', session: 's', surface: 'browser' });
     await waitFor(() => ext.dispatchCountFor(id) === 1, 5_000, 'command was not dispatched');
 
-    await fetch(`${BASE}/shutdown`, { method: 'POST', headers: HEADERS, signal: AbortSignal.timeout(2_000) });
+    await fetch(`${BASE}/shutdown`, { method: 'POST', headers: signedHeaders('POST', '/shutdown'), signal: AbortSignal.timeout(2_000) });
 
     // The contract under test: a structured JSON response, not a socket hang-up.
     const { status, result } = await inflight;

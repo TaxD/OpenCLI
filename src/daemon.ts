@@ -13,9 +13,11 @@
  *      Browser Bridge extension origin so the extension can probe daemon reachability
  *   4. Body size limit — 1 MB max to prevent OOM
  *   5. WebSocket verifyClient — reject upgrade before connection is established
- *   6. Shared-secret token (daemon-auth.ts) — every HTTP endpoint except /ping
- *      needs `Authorization: Bearer <token>`; the /ext upgrade needs `?token=`.
- *      Stops other local processes/users from driving the browser.
+ *   6. Shared-secret HMAC (daemon-auth.ts) — the token is never sent. Every
+ *      HTTP endpoint except /ping needs `Authorization: OpenCLI-HMAC ts;nonce;sig`
+ *      over method, path+query and body hash; the /ext upgrade signs ("GET",
+ *      "/ext") in its query. `/ping?nonce=` and the WS `daemon-challenge`
+ *      message let clients verify they reached the real daemon.
  *
  * Lifecycle:
  *   - Auto-spawned by opencli on first browser command
@@ -29,7 +31,7 @@ import { WebSocketServer, WebSocket, type RawData } from 'ws';
 import { DAEMON_HOST, DEFAULT_DAEMON_PORT, isIgnorableDaemonPortEnv, unsupportedDaemonPortEnvMessage } from './constants.js';
 import { EXIT_CODES } from './errors.js';
 import { log } from './logger.js';
-import { ensureDaemonToken, isAuthorizedExtUpgrade, isAuthorizedRequest } from './daemon-auth.js';
+import { NonceCache, PROOF_NONCE_RE, daemonProof, ensureDaemonToken, isAuthorizedExtUpgrade, isAuthorizedRequest } from './daemon-auth.js';
 import { PKG_VERSION } from './version.js';
 import { DEFAULT_CONTEXT_ID } from './browser/profile.js';
 import { recordExtensionVersion } from './update-check.js';
@@ -56,6 +58,7 @@ if (!isIgnorableDaemonPortEnv(process.env.OPENCLI_DAEMON_PORT)) {
   process.exit(EXIT_CODES.USAGE_ERROR);
 }
 
+const nonceCache = new NonceCache();
 let DAEMON_TOKEN: string;
 try {
   DAEMON_TOKEN = ensureDaemonToken();
@@ -247,7 +250,7 @@ function unregisterExtensionConnection(ws: WebSocket): void {
 
 const MAX_BODY = 1024 * 1024; // 1 MB — commands are tiny; this prevents OOM
 
-function readBody(req: IncomingMessage): Promise<string> {
+function readBody(req: IncomingMessage): Promise<Buffer> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
     let size = 0;
@@ -257,7 +260,7 @@ function readBody(req: IncomingMessage): Promise<string> {
       if (size > MAX_BODY) { aborted = true; req.destroy(); reject(new Error('Body too large')); return; }
       chunks.push(c);
     });
-    req.on('end', () => { if (!aborted) resolve(Buffer.concat(chunks).toString('utf-8')); });
+    req.on('end', () => { if (!aborted) resolve(Buffer.concat(chunks)); });
     req.on('error', (err) => { if (!aborted) reject(err); });
   });
 }
@@ -304,12 +307,29 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
   // Timing side-channels can reveal daemon presence to local processes, which
   // is an accepted risk given the daemon is loopback-only and short-lived.
   if (req.method === 'GET' && pathname === '/ping') {
-    jsonResponse(res, 200, { ok: true }, getResponseCorsHeaders(pathname, origin));
+    // `?nonce=<hex>` asks the daemon to prove it holds the token.
+    const nonce = new URL(url, 'http://127.0.0.1').searchParams.get('nonce');
+    if (nonce === null) {
+      jsonResponse(res, 200, { ok: true }, getResponseCorsHeaders(pathname, origin));
+    } else if (PROOF_NONCE_RE.test(nonce)) {
+      jsonResponse(res, 200, { ok: true, proof: daemonProof(DAEMON_TOKEN, nonce) }, getResponseCorsHeaders(pathname, origin));
+    } else {
+      jsonResponse(res, 400, { ok: false, error: 'Invalid nonce' }, getResponseCorsHeaders(pathname, origin));
+    }
+    return;
+  }
+
+  // The signature covers the body hash, so read it (≤ MAX_BODY) first.
+  let rawBody: Buffer;
+  try {
+    rawBody = await readBody(req);
+  } catch {
+    jsonResponse(res, 413, { ok: false, error: 'Body too large' });
     return;
   }
 
   // Every other endpoint requires the shared-secret bearer token.
-  if (!isAuthorizedRequest(req, DAEMON_TOKEN)) {
+  if (!isAuthorizedRequest(req, rawBody, DAEMON_TOKEN, nonceCache)) {
     jsonResponse(res, 401, { ok: false, error: 'Unauthorized' });
     return;
   }
@@ -384,7 +404,7 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
 
   if (req.method === 'POST' && url === '/command') {
     try {
-      const body = JSON.parse(await readBody(req));
+      const body = JSON.parse(rawBody.toString('utf-8'));
       if (!body.id) {
         jsonResponse(res, 400, { ok: false, error: 'Missing command id' });
         return;
@@ -576,8 +596,8 @@ const wss = new WebSocketServer({
     // enforce CORS on WebSocket, so a malicious webpage could connect to
     // ws://localhost:19825/ext and impersonate the Extension.  Real Chrome
     // Extensions send origin chrome-extension://<id>.  The upgrade must also
-    // carry ?token=<shared secret> (never log req.url: it contains the token).
-    return isAuthorizedExtUpgrade(req, DAEMON_TOKEN);
+    // carry a fresh ?ts&nonce&sig signature over ("GET", "/ext").
+    return isAuthorizedExtUpgrade(req, DAEMON_TOKEN, nonceCache);
   },
 });
 
@@ -608,6 +628,15 @@ wss.on('connection', (ws: WebSocket) => {
   ws.on('message', (data: RawData) => {
     try {
       const msg = JSON.parse(data.toString());
+
+      // Identity challenge — the extension sends this first, before hello,
+      // and waits for the proof before trusting anything else on the socket.
+      if (msg.type === 'daemon-challenge') {
+        if (typeof msg.nonce === 'string' && PROOF_NONCE_RE.test(msg.nonce)) {
+          ws.send(JSON.stringify({ type: 'daemon-proof', proof: daemonProof(DAEMON_TOKEN, msg.nonce) }));
+        }
+        return;
+      }
 
       // Handle hello message from extension (version handshake)
       if (msg.type === 'hello') {

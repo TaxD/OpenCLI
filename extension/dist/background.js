@@ -922,6 +922,42 @@ async function executeWithJournal(cmd, execute) {
   }
 }
 
+const enc = new TextEncoder();
+function toHex(bytes) {
+  return [...bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+function randomNonce() {
+  const bytes = new Uint8Array(16);
+  crypto.getRandomValues(bytes);
+  return toHex(bytes);
+}
+function importDaemonKey(token) {
+  return crypto.subtle.importKey("raw", enc.encode(token), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+}
+async function hmacHex(key, data) {
+  return toHex(await crypto.subtle.sign("HMAC", key, enc.encode(data)));
+}
+async function signParts(key, method, pathAndQuery, body = "") {
+  const ts = String(Date.now());
+  const nonce = randomNonce();
+  const bodyHash = toHex(await crypto.subtle.digest("SHA-256", enc.encode(body)));
+  const sig = await hmacHex(key, [method.toUpperCase(), pathAndQuery, ts, nonce, bodyHash].join("\n"));
+  return { ts, nonce, sig };
+}
+function authorizationHeader(parts) {
+  return `OpenCLI-HMAC ts=${parts.ts};nonce=${parts.nonce};sig=${parts.sig}`;
+}
+function expectedDaemonProof(key, nonce) {
+  return hmacHex(key, `opencli-daemon-proof
+${nonce}`);
+}
+function constantTimeEqual(a, b) {
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return diff === 0;
+}
+
 let ws = null;
 let reconnectTimer = null;
 let reconnectAttempts = 0;
@@ -982,8 +1018,10 @@ function forwardLog(level, args) {
   } catch {
   }
 }
+const verifiedSockets = /* @__PURE__ */ new WeakSet();
+const DAEMON_PROOF_TIMEOUT_MS = 5e3;
 function safeSend(socket, payload) {
-  if (!socket || socket.readyState !== WebSocket.OPEN) return false;
+  if (!socket || socket.readyState !== WebSocket.OPEN || !verifiedSockets.has(socket)) return false;
   try {
     socket.send(JSON.stringify(payload));
     return true;
@@ -1045,13 +1083,27 @@ async function connectAttempt() {
     return;
   }
   if (isDaemonSocketActive()) return;
+  let key;
   try {
-    const res = await fetch(DAEMON_PING_URL, {
+    key = await importDaemonKey(token);
+  } catch {
+    scheduleReconnect();
+    return;
+  }
+  try {
+    const pingNonce = randomNonce();
+    const res = await fetch(`${DAEMON_PING_URL}?nonce=${pingNonce}`, {
       signal: AbortSignal.timeout(1e3),
       credentials: "omit"
     });
     if (!res.ok) {
       console.warn(`[opencli] daemon ping failed: HTTP ${res.status}`);
+      scheduleReconnect();
+      return;
+    }
+    const body = await res.json().catch(() => null);
+    if (typeof body?.proof !== "string" || !constantTimeEqual(body.proof, await expectedDaemonProof(key, pingNonce))) {
+      console.warn("[opencli] process on the daemon port failed the identity proof; not connecting");
       scheduleReconnect();
       return;
     }
@@ -1065,15 +1117,38 @@ async function connectAttempt() {
   try {
     const contextId = await getCurrentContextId();
     if (isDaemonSocketActive()) return;
-    thisWs = new WebSocket(`${DAEMON_WS_URL}?token=${encodeURIComponent(token)}`);
+    const sig = await signParts(key, "GET", "/ext");
+    if (isDaemonSocketActive()) return;
+    thisWs = new WebSocket(`${DAEMON_WS_URL}?ts=${sig.ts}&nonce=${sig.nonce}&sig=${sig.sig}`);
     ws = thisWs;
     currentContextId = contextId;
   } catch {
     scheduleReconnect();
     return;
   }
+  let challenge = null;
+  let proofTimer = null;
+  const rejectDaemon = (why) => {
+    if (proofTimer) clearTimeout(proofTimer);
+    proofTimer = null;
+    challenge = null;
+    console.warn(`[opencli] ${why}; closing daemon connection`);
+    thisWs.close();
+  };
   thisWs.onopen = () => {
     if (ws !== thisWs) return;
+    challenge = randomNonce();
+    try {
+      thisWs.send(JSON.stringify({ type: "daemon-challenge", nonce: challenge }));
+    } catch {
+      thisWs.close();
+      return;
+    }
+    proofTimer = setTimeout(() => {
+      if (!verifiedSockets.has(thisWs)) rejectDaemon("daemon did not prove its identity in time");
+    }, DAEMON_PROOF_TIMEOUT_MS);
+  };
+  const onDaemonVerified = () => {
     console.log("[opencli] Connected to daemon");
     reconnectAttempts = 0;
     if (reconnectTimer) {
@@ -1090,16 +1165,39 @@ async function connectAttempt() {
   };
   thisWs.onmessage = async (event) => {
     if (ws !== thisWs) return;
+    if (!verifiedSockets.has(thisWs)) {
+      const nonce = challenge;
+      challenge = null;
+      let proof;
+      try {
+        const msg = JSON.parse(event.data);
+        if (msg?.type === "daemon-proof") proof = msg.proof;
+      } catch {
+      }
+      const ok = !!nonce && typeof proof === "string" && constantTimeEqual(proof, await expectedDaemonProof(key, nonce));
+      if (!ok) {
+        rejectDaemon("daemon failed the identity proof");
+        return;
+      }
+      if (proofTimer) clearTimeout(proofTimer);
+      proofTimer = null;
+      if (ws !== thisWs || thisWs.readyState !== WebSocket.OPEN) return;
+      verifiedSockets.add(thisWs);
+      onDaemonVerified();
+      return;
+    }
     try {
       const command = JSON.parse(event.data);
       const result = await executeWithJournal(command, handleCommand);
-      const target = ws && ws.readyState === WebSocket.OPEN ? ws : thisWs;
+      const target = ws && ws.readyState === WebSocket.OPEN && verifiedSockets.has(ws) ? ws : thisWs;
       safeSend(target, result);
     } catch (err) {
       console.error("[opencli] Message handling error:", err);
     }
   };
   thisWs.onclose = () => {
+    if (proofTimer) clearTimeout(proofTimer);
+    proofTimer = null;
     stopWsKeepalive(thisWs);
     if (ws !== thisWs) return;
     console.log("[opencli] Disconnected from daemon");
@@ -1869,9 +1967,10 @@ async function fetchDaemonVersion() {
   try {
     const token = await loadDaemonToken();
     if (!token) return null;
+    const auth = authorizationHeader(await signParts(await importDaemonKey(token), "GET", "/status"));
     const res = await fetch(`http://${DAEMON_HOST}:${DAEMON_PORT}/status`, {
       method: "GET",
-      headers: { "X-OpenCLI": "1", Authorization: `Bearer ${token}` },
+      headers: { "X-OpenCLI": "1", Authorization: auth },
       signal: AbortSignal.timeout(1500)
     });
     if (!res.ok) return null;
