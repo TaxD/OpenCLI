@@ -102,7 +102,18 @@ export function readDaemonTokenOrNull(): string | null {
 
 export const AUTH_SCHEME = 'OpenCLI-HMAC';
 export const MAX_CLOCK_SKEW_MS = 30_000;
-export const NONCE_TTL_MS = 60_000;
+/**
+ * A nonce accepted at time `a` carries ts ≥ a − 30s, so it can be presented
+ * again until ts + 30s ≤ a + 60s. Keeping it 61s (valid while now ≤ expiry)
+ * covers that last instant with margin.
+ */
+export const NONCE_TTL_MS = 2 * MAX_CLOCK_SKEW_MS + 1_000;
+/**
+ * Signatures dated before this daemon instance started (minus this slack for
+ * clock granularity / sign-then-connect delay) are rejected, so a restart does
+ * not reopen the replay window of the previous instance's empty nonce cache.
+ */
+export const START_SLACK_MS = 2_000;
 const NONCE_RE = /^[0-9a-f]{32}$/;
 const SIG_RE = /^[0-9a-f]{64}$/;
 const TS_RE = /^\d{1,16}$/;
@@ -172,17 +183,27 @@ export function parseAuthorization(header: unknown): SignatureParts | null {
 }
 
 /**
- * Remembers nonces for NONCE_TTL_MS. Fails closed when full so an attacker
- * cannot flush a nonce out of the cache and replay it inside the window.
+ * Replay guard for one daemon instance: remembers nonces for NONCE_TTL_MS and
+ * rejects signatures dated before `notBefore` (instance start − START_SLACK_MS).
+ * Fails closed when full so an attacker cannot flush a nonce out of the cache
+ * and replay it inside the window.
  */
 export class NonceCache {
   private readonly seen = new Map<string, number>();
-  constructor(private readonly maxEntries = 10_000, private readonly ttlMs = NONCE_TTL_MS) {}
+  readonly notBefore: number;
+  private readonly maxEntries: number;
+  private readonly ttlMs: number;
+
+  constructor(opts: { maxEntries?: number; ttlMs?: number; startedAt?: number } = {}) {
+    this.maxEntries = opts.maxEntries ?? 10_000;
+    this.ttlMs = opts.ttlMs ?? NONCE_TTL_MS;
+    this.notBefore = (opts.startedAt ?? Date.now()) - START_SLACK_MS;
+  }
 
   /** True when the nonce is new (and records it); false on replay or overflow. */
   claim(nonce: string, now = Date.now()): boolean {
     for (const [n, expiry] of this.seen) {
-      if (expiry > now) break; // insertion order ≈ expiry order
+      if (expiry >= now) break; // still valid at its expiry instant; insertion order ≈ expiry order
       this.seen.delete(n);
     }
     if (this.seen.has(nonce) || this.seen.size >= this.maxEntries) return false;
@@ -204,6 +225,7 @@ export function verifySignature(
   if (!parts || typeof parts.ts !== 'string' || typeof parts.nonce !== 'string' || typeof parts.sig !== 'string') return false;
   if (!TS_RE.test(parts.ts) || !NONCE_RE.test(parts.nonce) || !SIG_RE.test(parts.sig)) return false;
   if (Math.abs(now - Number(parts.ts)) > MAX_CLOCK_SKEW_MS) return false;
+  if (Number(parts.ts) < nonces.notBefore) return false; // signed for an earlier daemon instance
   const expected = Buffer.from(computeSignature(token, method, pathAndQuery, parts.ts, parts.nonce, sha256Hex(body)), 'utf-8');
   const provided = Buffer.from(parts.sig, 'utf-8');
   if (expected.length !== provided.length || !crypto.timingSafeEqual(expected, provided)) return false;

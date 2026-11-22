@@ -1250,6 +1250,52 @@ describe('background tab isolation', () => {
     expect(JSON.stringify(headers)).not.toContain(TEST_DAEMON_TOKEN);
   });
 
+  it('never follows redirects from the daemon port: /ping 3xx means no WebSocket, /status 3xx is ignored', async () => {
+    const { chrome } = createChromeMock();
+    vi.stubGlobal('chrome', chrome);
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const daemonCalls: Array<[string, RequestInit | undefined]> = [];
+    const redirect = { ok: false, status: 0, type: 'opaqueredirect', json: async () => ({}) };
+    vi.stubGlobal('fetch', withDaemonToken(vi.fn(async (url: string, init?: RequestInit) => {
+      daemonCalls.push([url, init]);
+      return redirect;
+    })));
+
+    const mod = await import('./background');
+    await mod.__test__.connectForTest();
+
+    expect(MockWebSocket.instances).toHaveLength(0);
+    expect(daemonCalls.length).toBeGreaterThan(0);
+    expect(daemonCalls.every(([, init]) => init?.redirect === 'manual')).toBe(true);
+    expect(daemonCalls.every(([url]) => url.includes('/ping?nonce='))).toBe(true);
+  });
+
+  it('ignores a 3xx /status reply even with a proof header', async () => {
+    const { chrome } = createChromeMock();
+    vi.stubGlobal('chrome', chrome);
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const statusInits: RequestInit[] = [];
+    vi.stubGlobal('fetch', withDaemonToken(vi.fn(async (url: string, init?: RequestInit) => {
+      if (!String(url).endsWith('/status')) return { ok: true };
+      statusInits.push(init!);
+      const challenge = (init!.headers as Record<string, string>)['X-OpenCLI-Challenge'];
+      const proof = await refHmac(`opencli-response\n${challenge}\n302\n${hexOf(await crypto.subtle.digest('SHA-256', new Uint8Array()))}`);
+      return new Response(null, { status: 302, headers: { Location: 'http://evil.example/', 'X-OpenCLI-Proof': proof } });
+    })));
+
+    const mod = await import('./background');
+    await mod.__test__.connectForTest();
+    await completeDaemonHandshake(MockWebSocket.instances[0]);
+    const onMessageListener = chrome.runtime.onMessage.addListener.mock.calls[0][0];
+    const sendResponse = vi.fn();
+    onMessageListener({ type: 'getStatus' }, {}, sendResponse);
+    await vi.waitFor(() => {
+      expect(sendResponse).toHaveBeenCalledWith(expect.objectContaining({ connected: true, daemonVersion: null }));
+    });
+    expect(statusInits).toHaveLength(1);
+    expect(statusInits[0].redirect).toBe('manual');
+  });
+
   it('keeps the active daemon connection when a superseded WebSocket closes later', async () => {
     const { chrome } = createChromeMock();
     vi.stubGlobal('chrome', chrome);

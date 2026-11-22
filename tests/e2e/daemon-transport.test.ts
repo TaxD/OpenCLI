@@ -183,7 +183,8 @@ describe('daemon transport contracts (real daemon)', () => {
     }
     daemon = spawn(process.execPath, [DAEMON_ENTRY], {
       stdio: ['ignore', 'ignore', 'pipe'],
-      env: { ...process.env, OPENCLI_DAEMON_TOKEN_FILE: TOKEN_FILE },
+      // Throwaway HOME: the daemon must not touch the real ~/.opencli.
+      env: { ...process.env, HOME: path.dirname(TOKEN_FILE), USERPROFILE: path.dirname(TOKEN_FILE), OPENCLI_DAEMON_TOKEN_FILE: TOKEN_FILE },
     });
     let stderr = '';
     daemon.stderr?.on('data', (chunk) => { stderr += chunk.toString(); });

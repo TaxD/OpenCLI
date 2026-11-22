@@ -58,7 +58,7 @@ if (!isIgnorableDaemonPortEnv(process.env.OPENCLI_DAEMON_PORT)) {
   process.exit(EXIT_CODES.USAGE_ERROR);
 }
 
-const nonceCache = new NonceCache();
+const nonceCache = new NonceCache({ startedAt: Date.now() });
 let DAEMON_TOKEN: string;
 try {
   DAEMON_TOKEN = ensureDaemonToken();

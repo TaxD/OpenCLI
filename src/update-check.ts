@@ -18,6 +18,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
 import { PKG_VERSION } from './version.js';
+import { isDaemonManaged } from './constants.js';
 
 const CACHE_DIR = path.join(os.homedir(), '.opencli');
 const CACHE_FILE = path.join(CACHE_DIR, 'update-check.json');
@@ -223,6 +224,7 @@ export function checkForUpdateBackground(): void {
  */
 export function recordExtensionVersion(version: string): void {
   if (typeof version !== 'string' || !version.trim()) return;
+  if (isDaemonManaged()) return; // managed daemons never write ~/.opencli
   writeCacheMerge({
     currentExtensionVersion: version.trim(),
     extensionLastSeenAt: Date.now(),

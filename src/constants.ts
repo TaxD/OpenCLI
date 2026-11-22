@@ -14,6 +14,16 @@ export const DEFAULT_DAEMON_PORT = 19825;
  */
 export const DAEMON_HOST = '127.0.0.1';
 
+/**
+ * OPENCLI_DAEMON_MANAGED=1: an external manager owns the daemon's lifetime,
+ * and the CLI runs built-in code only — no user adapters, plugins, startup
+ * hooks or ~/.opencli writes, and no update checks or other self-initiated
+ * network requests besides the daemon on 127.0.0.1.
+ */
+export function isDaemonManaged(): boolean {
+  return process.env.OPENCLI_DAEMON_MANAGED === '1';
+}
+
 export function unsupportedDaemonPortEnvMessage(value?: string): string {
   const suffix = value ? ` (received ${value})` : '';
   return `OPENCLI_DAEMON_PORT is no longer supported${suffix}. ` +

@@ -14,12 +14,15 @@ import {
 import { BrowserConnectError, SessionBusyError } from '../errors.js';
 import { createHash, createHmac } from 'node:crypto';
 import * as fs from 'node:fs';
+import { createServer } from 'node:http';
+import type { AddressInfo } from 'node:net';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import * as daemonLifecycle from './daemon-lifecycle.js';
 import { UnauthenticatedDaemonError, requestDaemon } from './daemon-transport.js';
 import { responseProof } from '../daemon-auth.js';
 
+const realFetch = globalThis.fetch;
 const TEST_TOKEN = 't'.repeat(64);
 const SIGNED = /^OpenCLI-HMAC ts=\d+;nonce=[0-9a-f]{32};sig=[0-9a-f]{64}$/;
 
@@ -150,6 +153,33 @@ describe('daemon-client', () => {
       expect(killSpy).not.toHaveBeenCalled();
       expect(spawnSpy).not.toHaveBeenCalled();
       expect(shutdownSpy).not.toHaveBeenCalled();
+    });
+
+    it.each([302, 307, 308])('never follows a %i from the daemon port: one request, unauthenticated error, no spawn/kill', async (code) => {
+      const hits: string[] = [];
+      const server = createServer((req, res) => {
+        hits.push(`${req.method} ${req.url}`);
+        if (req.url === '/stolen') { res.writeHead(200, { 'Content-Type': 'application/json' }); res.end('{}'); return; }
+        res.writeHead(code, { Location: `http://127.0.0.1:${(server.address() as AddressInfo).port}/stolen` });
+        res.end();
+      });
+      await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+      const port = (server.address() as AddressInfo).port;
+      // Real undici fetch, retargeted from the fixed daemon port to the test server.
+      vi.stubGlobal('fetch', vi.fn((url: string, init?: RequestInit) =>
+        realFetch(String(url).replace(':19825', `:${port}`), init)));
+      const killSpy = vi.spyOn(process, 'kill').mockImplementation(() => true);
+      const spawnSpy = vi.spyOn(daemonLifecycle.daemonLifecycleHooks, 'spawnDaemonProcess').mockImplementation(() => { throw new Error('spawned'); });
+      try {
+        await expect(fetchDaemonStatus()).rejects.toBeInstanceOf(UnauthenticatedDaemonError);
+        await expect(requestDaemon('/command', { method: 'POST', body: '{"id":"x"}' })).rejects.toThrow(/redirect/);
+        await expect(daemonLifecycle.ensureBrowserBridgeReady({ timeoutSeconds: 1, verbose: false })).rejects.toBeInstanceOf(UnauthenticatedDaemonError);
+        expect(hits).toEqual(['GET /status', 'POST /command', 'GET /status']);
+        expect(killSpy).not.toHaveBeenCalled();
+        expect(spawnSpy).not.toHaveBeenCalled();
+      } finally {
+        await new Promise((resolve) => server.close(resolve));
+      }
     });
 
     it('accepts only the exact status code and body the proof covers', async () => {

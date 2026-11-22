@@ -1051,6 +1051,9 @@ console.error = (...args) => {
 };
 const DAEMON_TOKEN_RE = /^[A-Za-z0-9_-]{32,}$/;
 let daemonTokenProblemLogged = false;
+function isRedirectResponse(res) {
+  return res.type === "opaqueredirect" || res.status >= 300 && res.status < 400;
+}
 async function loadDaemonToken() {
   let reason;
   try {
@@ -1102,8 +1105,14 @@ async function connectAttempt() {
     const pingNonce = randomNonce();
     const res = await fetch(`${DAEMON_PING_URL}?nonce=${pingNonce}`, {
       signal: AbortSignal.timeout(1e3),
-      credentials: "omit"
+      credentials: "omit",
+      redirect: "manual"
     });
+    if (isRedirectResponse(res)) {
+      console.warn("[opencli] process on the daemon port answered with a redirect; not connecting");
+      scheduleReconnect();
+      return;
+    }
     if (!res.ok) {
       console.warn(`[opencli] daemon ping failed: HTTP ${res.status}`);
       scheduleReconnect();
@@ -1981,8 +1990,13 @@ async function fetchDaemonVersion() {
     const res = await fetch(`http://${DAEMON_HOST}:${DAEMON_PORT}/status`, {
       method: "GET",
       headers: { "X-OpenCLI": "1", Authorization: auth, "X-OpenCLI-Challenge": challenge },
-      signal: AbortSignal.timeout(1500)
+      signal: AbortSignal.timeout(1500),
+      redirect: "manual"
     });
+    if (isRedirectResponse(res)) {
+      console.warn("[opencli] unauthenticated redirect from the daemon port; ignoring it");
+      return null;
+    }
     const raw = await res.arrayBuffer();
     if (!await verifyResponseProof(key, challenge, res.status, raw, res.headers.get("X-OpenCLI-Proof"))) {
       console.warn("[opencli] unauthenticated /status reply on the daemon port; ignoring it");

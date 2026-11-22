@@ -2,7 +2,7 @@ import {
   CHALLENGE_HEADER, PROOF_HEADER, authorizationHeader, daemonTokenPath, newNonce, readDaemonTokenOrNull, signParts, verifyResponseProof,
 } from '../daemon-auth.js';
 import { BrowserConnectError } from '../errors.js';
-import { DAEMON_HOST, DEFAULT_DAEMON_PORT, isIgnorableDaemonPortEnv, unsupportedDaemonPortEnvMessage } from '../constants.js';
+import { DAEMON_HOST, DEFAULT_DAEMON_PORT, isDaemonManaged, isIgnorableDaemonPortEnv, unsupportedDaemonPortEnvMessage } from '../constants.js';
 
 const DAEMON_PORT = DEFAULT_DAEMON_PORT;
 const DAEMON_URL = `http://${DAEMON_HOST}:${DAEMON_PORT}`;
@@ -15,10 +15,7 @@ class UnsupportedDaemonPortEnvError extends Error {
   }
 }
 
-/** OPENCLI_DAEMON_MANAGED=1: an external manager owns the daemon's lifetime. */
-export function isDaemonManaged(): boolean {
-  return process.env.OPENCLI_DAEMON_MANAGED === '1';
-}
+export { isDaemonManaged };
 
 /**
  * Whatever answered on the daemon port could not prove it holds the token.
@@ -26,11 +23,13 @@ export function isDaemonManaged(): boolean {
  * must neither spawn a replacement nor send it a shutdown.
  */
 export class UnauthenticatedDaemonError extends BrowserConnectError {
-  constructor(reason: 'no-token' | 'bad-proof') {
+  constructor(reason: 'no-token' | 'bad-proof' | 'redirect') {
     super(
       reason === 'no-token'
         ? `Something is listening on port ${DEFAULT_DAEMON_PORT}, but the daemon token at ${daemonTokenPath()} cannot be read`
-        : `An unauthenticated program is listening on port ${DEFAULT_DAEMON_PORT}: its response did not carry a valid opencli daemon proof`,
+        : reason === 'redirect'
+          ? `An unauthenticated program is listening on port ${DEFAULT_DAEMON_PORT}: it answered with a redirect, which the opencli daemon never sends`
+          : `An unauthenticated program is listening on port ${DEFAULT_DAEMON_PORT}: its response did not carry a valid opencli daemon proof`,
       reason === 'no-token'
         ? 'Make sure the token file exists, is owned by you with mode 600, and OPENCLI_DAEMON_TOKEN_FILE matches the daemon.'
         : `Its reply was ignored. Either another program (possibly another user's) holds port ${DEFAULT_DAEMON_PORT}, ` +
@@ -117,7 +116,13 @@ export async function requestDaemon(pathname: string, init?: RequestInit & { tim
         [CHALLENGE_HEADER]: challenge,
       },
       signal: controller.signal,
+      // Never follow a 3xx: it would re-send the signed headers and body elsewhere.
+      redirect: 'manual',
     });
+    if (res.status >= 300 && res.status < 400) {
+      await res.body?.cancel().catch(() => {});
+      throw new UnauthenticatedDaemonError('redirect');
+    }
     const body = new Uint8Array(await res.arrayBuffer());
     if (!token) throw new UnauthenticatedDaemonError('no-token');
     if (!verifyResponseProof(token, challenge, res.status, body, res.headers.get(PROOF_HEADER))) {

@@ -19,6 +19,10 @@ import {
   responseProof,
   signParts,
   verifyResponseProof,
+  verifySignature,
+  MAX_CLOCK_SKEW_MS,
+  NONCE_TTL_MS,
+  START_SLACK_MS,
 } from './daemon-auth.js';
 
 const posix = process.platform !== 'win32';
@@ -118,12 +122,57 @@ describe('signature primitives', () => {
   });
 
   it('NonceCache rejects replays, forgets after the TTL, and fails closed when full', () => {
-    const cache = new NonceCache(2, 60_000);
+    const cache = new NonceCache({ maxEntries: 2, ttlMs: 60_000, startedAt: 0 });
     expect(cache.claim('a', 0)).toBe(true);
     expect(cache.claim('a', 1)).toBe(false);
     expect(cache.claim('b', 2)).toBe(true);
     expect(cache.claim('c', 3)).toBe(false); // full
     expect(cache.claim('a', 60_001)).toBe(true); // expired
+  });
+});
+
+describe('replay boundaries', () => {
+  const token = 'r'.repeat(64);
+  const signed = (ts: number, nonce = 'ab'.repeat(16)) =>
+    ({ ts: String(ts), nonce, sig: refSig(token, 'GET', '/status', String(ts), nonce) });
+  const check = (parts: ReturnType<typeof signed>, cache: NonceCache, now: number) =>
+    verifySignature(token, parts, 'GET', '/status', '', cache, now);
+
+  it('keeps nonces strictly longer than any signature stays valid', () => {
+    expect(NONCE_TTL_MS).toBeGreaterThan(2 * MAX_CLOCK_SKEW_MS);
+  });
+
+  it('rejects a replay at the last instant of the ±30s window (accepted at the first instant)', () => {
+    const T = 1_000_000_000;
+    const cache = new NonceCache({ startedAt: 0 });
+    const parts = signed(T);
+    expect(check(parts, cache, T - MAX_CLOCK_SKEW_MS)).toBe(true);   // earliest acceptance
+    expect(check(parts, cache, T + MAX_CLOCK_SKEW_MS)).toBe(false);  // latest instant the ts is still in-window
+    expect(check(parts, cache, T + MAX_CLOCK_SKEW_MS + 1)).toBe(false); // out of window anyway
+  });
+
+  it('treats a nonce as remembered up to and including its expiry instant', () => {
+    const cache = new NonceCache({ maxEntries: 10, ttlMs: 1_000, startedAt: 0 });
+    expect(cache.claim('n', 0)).toBe(true);
+    expect(cache.claim('n', 1_000)).toBe(false);
+    expect(cache.claim('n', 1_001)).toBe(true);
+  });
+
+  it('rejects signatures dated before the daemon instance started (beyond the slack)', () => {
+    const S = 2_000_000_000;
+    const cache = new NonceCache({ startedAt: S });
+    expect(check(signed(S - START_SLACK_MS - 1, '01'.repeat(16)), cache, S)).toBe(false);
+    expect(check(signed(S - START_SLACK_MS, '02'.repeat(16)), cache, S)).toBe(true); // within slack: accepted (documented residual)
+    expect(check(signed(S + 10, '03'.repeat(16)), cache, S + 20)).toBe(true);
+  });
+
+  it('a restarted daemon does not accept a signature the previous instance saw', () => {
+    const T = 3_000_000_000;
+    const parts = signed(T);
+    const before = new NonceCache({ startedAt: T - 60_000 });
+    expect(check(parts, before, T)).toBe(true);
+    const restarted = new NonceCache({ startedAt: T + START_SLACK_MS + 1 }); // fresh, empty cache
+    expect(check(parts, restarted, T + START_SLACK_MS + 1)).toBe(false);
   });
 });
 

@@ -21,7 +21,7 @@ import { findPackageRoot, getCliManifestPath } from './package-paths.js';
 import { PKG_VERSION } from './version.js';
 import { EXIT_CODES } from './errors.js';
 import { isSupportedNodeVersion, MIN_SUPPORTED_NODE_MAJOR } from './runtime-detect.js';
-import { isIgnorableDaemonPortEnv, unsupportedDaemonPortEnvMessage } from './constants.js';
+import { isDaemonManaged, isIgnorableDaemonPortEnv, unsupportedDaemonPortEnvMessage } from './constants.js';
 
 const __filename = fileURLToPath(import.meta.url);
 // Adapters are JS-first and live at <package-root>/clis/.
@@ -32,6 +32,8 @@ const USER_CLIS = path.join(os.homedir(), '.opencli', 'clis');
 // ── Ultra-fast path: lightweight commands bypass full discovery ──────────
 // These are high-frequency or trivial paths that must not pay the startup tax.
 const argv = process.argv.slice(2);
+// Managed mode runs built-in code only (see isDaemonManaged).
+const BUILTIN_ONLY = isDaemonManaged();
 
 if (typeof (globalThis as { Bun?: unknown }).Bun === 'undefined' && !isSupportedNodeVersion(process.version)) {
   const { emitFailure } = await import('./command-output.js');
@@ -67,7 +69,9 @@ if (getCompIdx !== -1) {
   // With sparse override, the user clis dir may exist but have no manifest.
   const manifestPaths = [getCliManifestPath(BUILTIN_CLIS)];
   const userManifest = getCliManifestPath(USER_CLIS);
-  try { fs.accessSync(userManifest); manifestPaths.push(userManifest); } catch { /* no user manifest */ }
+  if (!BUILTIN_ONLY) {
+    try { fs.accessSync(userManifest); manifestPaths.push(userManifest); } catch { /* no user manifest */ }
+  }
   if (hasAllManifests(manifestPaths)) {
     const rest = process.argv.slice(getCompIdx + 1);
     let cursor: number | undefined;
@@ -110,7 +114,14 @@ try {
   //    user-CLI discovery MUST run after built-in discovery to preserve the
   //    intended override order (user adapters override built-in ones).
   //  - discoverPlugins runs last: plugins may override both built-in and user CLIs.
-  const skipUserDiscovery = argv[0] === 'convention-audit';
+  if (BUILTIN_ONLY && (argv[0] === 'plugin' || argv[0] === 'adapter')) {
+    const { CliError } = await import('./errors.js');
+    throw new CliError('CONFIG', `"opencli ${argv[0]}" is disabled when OPENCLI_DAEMON_MANAGED=1`,
+      'Managed mode runs built-in adapters only and never writes ~/.opencli.', EXIT_CODES.CONFIG_ERROR);
+  }
+  // Managed mode: built-in adapters only — no user adapters/plugins, no
+  // compat shims or other ~/.opencli writes.
+  const skipUserDiscovery = BUILTIN_ONLY || argv[0] === 'convention-audit';
   if (skipUserDiscovery) {
     await discoverClis(BUILTIN_CLIS);
   } else {
@@ -123,10 +134,12 @@ try {
     await discoverPlugins();
   }
 
-  // Register exit hook: notice appears after command output (same as npm/gh/yarn)
-  registerUpdateNoticeOnExit();
-  // Kick off background fetch for next run (non-blocking)
-  checkForUpdateBackground();
+  if (!BUILTIN_ONLY) {
+    // Register exit hook: notice appears after command output (same as npm/gh/yarn)
+    registerUpdateNoticeOnExit();
+    // Kick off background fetch for next run (non-blocking)
+    checkForUpdateBackground();
+  }
 
   // ── Fallback completion: manifest unavailable, use full registry ─────────
   if (getCompIdx !== -1) {
@@ -158,7 +171,7 @@ try {
     }
   } catch { /* manifest unavailable; parse the original arguments */ }
 
-  await emitHook('onStartup', { command: '__startup__', args: {} });
+  if (!BUILTIN_ONLY) await emitHook('onStartup', { command: '__startup__', args: {} });
   await runCli(BUILTIN_CLIS, USER_CLIS);
 
 } catch (error) {
