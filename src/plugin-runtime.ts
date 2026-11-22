@@ -1,5 +1,6 @@
 /** Plugin runtime paths must resolve package imports against the running host. */
 
+import { assertNotManaged } from './constants.js';
 import * as fs from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import * as path from 'node:path';
@@ -50,6 +51,7 @@ function removeLink(linkPath: string): void {
 }
 
 export function linkHostOpencli(pluginDir: string): boolean {
+  assertNotManaged('Linking plugin host packages');
   let stagedLink: string | undefined;
   let staleLink: string | undefined;
   try {

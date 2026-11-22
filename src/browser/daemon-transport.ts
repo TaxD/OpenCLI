@@ -22,14 +22,25 @@ export { isDaemonManaged };
  * Nothing from that response (status, pid, version) may be used, and the CLI
  * must neither spawn a replacement nor send it a shutdown.
  */
+function tokenPathLabel(): string {
+  try { return daemonTokenPath(); } catch { return '(OPENCLI_DAEMON_TOKEN_FILE is not set)'; }
+}
+
+type UnauthenticatedReason = 'no-token' | 'bad-proof' | 'redirect' | 'too-large' | 'protocol';
+
+const UNAUTHENTICATED_DETAIL: Record<Exclude<UnauthenticatedReason, 'no-token'>, string> = {
+  'bad-proof': 'its response did not carry a valid opencli daemon proof',
+  redirect: 'it answered with a redirect, which the opencli daemon never sends',
+  'too-large': `its response exceeded the size limit before it could be authenticated`,
+  protocol: 'the connection was accepted but the exchange failed before the response could be authenticated',
+};
+
 export class UnauthenticatedDaemonError extends BrowserConnectError {
-  constructor(reason: 'no-token' | 'bad-proof' | 'redirect') {
+  constructor(reason: UnauthenticatedReason) {
     super(
       reason === 'no-token'
-        ? `Something is listening on port ${DEFAULT_DAEMON_PORT}, but the daemon token at ${daemonTokenPath()} cannot be read`
-        : reason === 'redirect'
-          ? `An unauthenticated program is listening on port ${DEFAULT_DAEMON_PORT}: it answered with a redirect, which the opencli daemon never sends`
-          : `An unauthenticated program is listening on port ${DEFAULT_DAEMON_PORT}: its response did not carry a valid opencli daemon proof`,
+        ? `Something is listening on port ${DEFAULT_DAEMON_PORT}, but the daemon token at ${tokenPathLabel()} cannot be read`
+        : `An unauthenticated program is listening on port ${DEFAULT_DAEMON_PORT}: ${UNAUTHENTICATED_DETAIL[reason]}`,
       reason === 'no-token'
         ? 'Make sure the token file exists, is owned by you with mode 600, and OPENCLI_DAEMON_TOKEN_FILE matches the daemon.'
         : `Its reply was ignored. Either another program (possibly another user's) holds port ${DEFAULT_DAEMON_PORT}, ` +
@@ -94,6 +105,61 @@ function authHeader(token: string | null, method: string, url: URL, body: Reques
 }
 
 /**
+ * Upper bound on a daemon response read before it is authenticated. Command
+ * results (e.g. full-page screenshots as base64) can legitimately reach a few
+ * tens of MiB, so the cap is generous but finite.
+ */
+export const MAX_DAEMON_RESPONSE_BYTES = 64 * 1024 * 1024;
+
+/** Stream the body, aborting past `max` bytes; any read failure is unauthenticated. */
+async function readCappedBody(res: Response, max: number): Promise<Uint8Array<ArrayBuffer>> {
+  const declared = Number(res.headers.get('content-length'));
+  if (Number.isFinite(declared) && declared > max) {
+    await res.body?.cancel().catch(() => {});
+    throw new UnauthenticatedDaemonError('too-large');
+  }
+  if (!res.body) return new Uint8Array(new ArrayBuffer(0));
+  const reader = res.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > max) {
+        await reader.cancel().catch(() => {});
+        throw new UnauthenticatedDaemonError('too-large');
+      }
+      chunks.push(value);
+    }
+  } catch (err) {
+    if (err instanceof UnauthenticatedDaemonError) throw err;
+    throw new UnauthenticatedDaemonError('protocol');
+  }
+  const out = new Uint8Array(new ArrayBuffer(total));
+  let offset = 0;
+  for (const c of chunks) { out.set(c, offset); offset += c.byteLength; }
+  return out;
+}
+
+/** True only when nothing accepted the TCP connection (the daemon is not running). */
+export function isConnectionRefused(err: unknown): boolean {
+  const seen = new Set<unknown>();
+  const stack: unknown[] = [err];
+  while (stack.length) {
+    const cur = stack.pop();
+    if (!cur || typeof cur !== 'object' || seen.has(cur)) continue;
+    seen.add(cur);
+    if ((cur as { code?: unknown }).code === 'ECONNREFUSED') return true;
+    stack.push((cur as { cause?: unknown }).cause);
+    const nested = (cur as { errors?: unknown }).errors;
+    if (Array.isArray(nested)) stack.push(...nested);
+  }
+  return false;
+}
+
+/**
  * Signed request + authenticated response. The returned Response is rebuilt
  * from bytes whose X-OpenCLI-Proof was verified; an unverifiable reply throws
  * UnauthenticatedDaemonError and is never surfaced.
@@ -123,7 +189,7 @@ export async function requestDaemon(pathname: string, init?: RequestInit & { tim
       await res.body?.cancel().catch(() => {});
       throw new UnauthenticatedDaemonError('redirect');
     }
-    const body = new Uint8Array(await res.arrayBuffer());
+    const body = await readCappedBody(res, MAX_DAEMON_RESPONSE_BYTES);
     if (!token) throw new UnauthenticatedDaemonError('no-token');
     if (!verifyResponseProof(token, challenge, res.status, body, res.headers.get(PROOF_HEADER))) {
       throw new UnauthenticatedDaemonError('bad-proof');
@@ -146,16 +212,27 @@ export async function fetchDaemonStatus(opts?: { timeout?: number; contextId?: s
     if (res.status === 401) {
       throw new BrowserConnectError(
         'opencli daemon rejected the request signature (Unauthorized)',
-        `The daemon proved it holds the token at ${daemonTokenPath()} but rejected this request ` +
+        `The daemon proved it holds the token at ${tokenPathLabel()} but rejected this request ` +
         '(system clock off by more than 30s, or a replayed nonce). Check the clock and retry.',
         'daemon-unauthenticated',
       );
     }
-    if (!res.ok) return null;
-    return await res.json() as DaemonStatus;
+    if (!res.ok) {
+      // Authenticated, but not a usable status: still never "stopped".
+      throw new BrowserConnectError(
+        `opencli daemon answered /status with HTTP ${res.status}`,
+        'Check the daemon log, or stop it manually and retry.',
+        'daemon-unauthenticated',
+      );
+    }
+    return JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(await res.arrayBuffer())) as DaemonStatus;
   } catch (err) {
     if (err instanceof UnsupportedDaemonPortEnvError || err instanceof BrowserConnectError) throw err;
-    return null;
+    // Only "nothing is listening" means stopped. A connection that was accepted
+    // but did not complete an authenticated exchange is never treated as "no
+    // daemon" (which would make the caller spawn one).
+    if (isConnectionRefused(err)) return null;
+    throw new UnauthenticatedDaemonError('protocol');
   }
 }
 

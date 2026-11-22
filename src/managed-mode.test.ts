@@ -98,6 +98,51 @@ describe('OPENCLI_DAEMON_MANAGED=1 runs built-in code only', () => {
     expect(fs.readdirSync(markers)).toEqual([]);
   }, 120_000);
 
+  it('rejects plugin/adapter/profile and other user-state writers under every argument order', async () => {
+    const { home, markers } = plantHome();
+    const pluginSrc = path.join(home, '.opencli', 'plugins', 'evil');
+    const before = snapshot(home);
+    proxyHits = [];
+    const attempts: string[][] = [
+      ['plugin', 'list'],
+      ['plugin', 'install', `file://${pluginSrc}`],
+      ['--profile', 'x', 'plugin', 'install', `file://${pluginSrc}`],
+      ['--profile=x', 'plugin', 'list'],
+      ['--profile', 'plugin', 'plugin', 'list'],
+      ['adapter', 'eject', 'hackernews'],
+      ['--profile', 'x', 'adapter', 'reset', 'hackernews'],
+      ['--profile', 'x', 'adapter', 'init', 'evil/pwn'],
+      ['profile', 'use', 'work'],
+      ['--profile', 'x', 'profile', 'rename', 'a', 'b'],
+      ['--profile=x', 'profile', 'list'],
+      ['auth', 'refresh'],
+      ['--profile', 'x', 'auth', 'refresh', '--all'],
+      ['hackernews', 'top', '--trace', 'on'],
+      ['--profile', 'x', 'hackernews', 'top', '--trace=retain-on-failure'],
+    ];
+    for (const args of attempts) {
+      const res = runCli(home, args, true);
+      expect(res.status, `${args.join(' ')}\n${res.stdout}${res.stderr}`).not.toBe(0);
+      expect(res.stdout + res.stderr, args.join(' ')).not.toContain('EVIL');
+      expect(snapshot(home), args.join(' ')).toEqual(before);
+    }
+    expect(fs.readdirSync(markers)).toEqual([]);
+    expect(proxyHits).toEqual([]);
+  }, 300_000);
+
+  it('the managed daemon refuses to start without OPENCLI_DAEMON_TOKEN_FILE and writes nothing', () => {
+    const { home } = plantHome();
+    const before = snapshot(home);
+    const env: NodeJS.ProcessEnv = { ...process.env, HOME: home, USERPROFILE: home, OPENCLI_DAEMON_MANAGED: '1' };
+    delete env.OPENCLI_DAEMON_TOKEN_FILE;
+    const res = spawnSync(process.execPath, ['--import', 'tsx/esm', path.join(ROOT, 'src', 'daemon.ts')], {
+      cwd: ROOT, env, encoding: 'utf-8', timeout: 30_000,
+    });
+    expect(res.status).toBe(78);
+    expect(res.stdout + res.stderr).toContain('OPENCLI_DAEMON_TOKEN_FILE must be set');
+    expect(snapshot(home)).toEqual(before);
+  });
+
   it('control: without the flag the same fixtures load, HOME is written and the update check fires', async () => {
     const { home, markers } = plantHome();
     const before = snapshot(home);

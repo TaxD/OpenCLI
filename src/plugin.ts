@@ -7,6 +7,7 @@
  * "https://github.com/user/repo", "file:///local/plugin", or a local directory path.
  */
 
+import { assertNotManaged } from './constants.js';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -494,6 +495,7 @@ function writeLockFileWithFs(
 }
 
 export function writeLockFile(lock: Record<string, LockEntry>): void {
+  assertNotManaged('Writing the plugin lock file');
   writeLockFileWithFs(lock, fs);
 }
 
@@ -701,6 +703,7 @@ function publishMonorepoPlugins(
  * Returns the installed plugin name(s).
  */
 export function installPlugin(source: string): string | string[] {
+  assertNotManaged('Installing plugins');
   const parsed = parseSource(source);
   if (!parsed) {
     throw new Error(
@@ -1063,6 +1066,7 @@ function updateStandaloneLockEntry(
  * directory when no more sub-plugins reference it.
  */
 export function uninstallPlugin(name: string): void {
+  assertNotManaged('Uninstalling plugins');
   const targetDir = managedPluginPath(PLUGINS_DIR, name);
   if (!fs.existsSync(targetDir)) {
     throw new Error(`Plugin "${name}" is not installed.`);
@@ -1117,6 +1121,7 @@ function isSymlinkSync(p: string): boolean {
  * for all sub-plugins from the same monorepo.
  */
 export function updatePlugin(name: string): void {
+  assertNotManaged('Updating plugins');
   const targetDir = managedPluginPath(PLUGINS_DIR, name);
   if (!fs.existsSync(targetDir)) {
     throw new Error(`Plugin "${name}" is not installed.`);
@@ -1210,6 +1215,7 @@ export interface UpdateResult {
  * Continues even if individual plugin updates fail.
  */
 export function updateAllPlugins(): UpdateResult[] {
+  assertNotManaged('Updating plugins');
   return listPlugins().map((plugin): UpdateResult => {
     try {
       updatePlugin(plugin.name);

@@ -8,6 +8,7 @@
  * 2. FALLBACK (filesystem scan): Traditional runtime discovery for development.
  */
 
+import { assertNotManaged, isDaemonManaged } from './constants.js';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -49,6 +50,7 @@ const PACKAGE_ROOT = findPackageRoot(fileURLToPath(import.meta.url));
  * Node.js resolves them through this symlink.
  */
 export async function ensureUserCliCompatShims(baseDir: string = USER_OPENCLI_DIR): Promise<void> {
+  assertNotManaged('Creating ~/.opencli compat shims');
   await fs.promises.mkdir(baseDir, { recursive: true });
 
   // package.json for ESM resolution in ~/.opencli/
@@ -90,6 +92,7 @@ export async function ensureUserCliCompatShims(baseDir: string = USER_OPENCLI_DI
  * Built-in adapters are loaded directly from the installed package.
  */
 export async function ensureUserAdapters(): Promise<void> {
+  assertNotManaged('Preparing ~/.opencli/clis');
   await fs.promises.mkdir(USER_CLIS_DIR, { recursive: true });
 }
 
@@ -98,6 +101,14 @@ export async function ensureUserAdapters(): Promise<void> {
  * Uses pre-compiled manifest when available for instant startup.
  */
 export async function discoverClis(...dirs: string[]): Promise<void> {
+  if (isDaemonManaged()) {
+    // Built-in adapters only: every directory must live inside this package.
+    const builtinRoot = path.join(PACKAGE_ROOT, 'clis');
+    for (const dir of dirs) {
+      const rel = path.relative(builtinRoot, path.resolve(dir));
+      if (rel.startsWith('..') || path.isAbsolute(rel)) assertNotManaged(`Loading adapters from ${dir}`);
+    }
+  }
   // Fast path: try manifest first (production / post-build)
   for (const dir of dirs) {
     const manifestPath = getCliManifestPath(dir);
@@ -200,6 +211,7 @@ async function discoverClisFromFs(dir: string): Promise<void> {
  * Files inside are scanned flat (no nested site subdirs).
  */
 export async function discoverPlugins(pluginRoot: string = PLUGINS_DIR): Promise<void> {
+  assertNotManaged('Loading plugins');
   try { await fs.promises.access(pluginRoot); } catch { return; }
   const entries = (await fs.promises.readdir(pluginRoot, { withFileTypes: true }))
     .sort((a, b) => a.name.localeCompare(b.name));

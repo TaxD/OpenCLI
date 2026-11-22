@@ -11,6 +11,7 @@ import {
   NonceCache,
   authorizationHeader,
   daemonProof,
+  wsProof,
   ensureDaemonToken,
   isAuthorizedExtUpgrade,
   isAuthorizedRequest,
@@ -103,6 +104,10 @@ describe('signature primitives', () => {
     expect(p.sig).toBe(refSig(token, 'POST', '/command', p.ts, p.nonce, '{"a":1}'));
     const nonce = 'ab'.repeat(16);
     expect(daemonProof(token, nonce)).toBe(createHmac('sha256', token).update(`opencli-daemon-proof\n${nonce}`).digest('hex'));
+    const sig = 'cd'.repeat(32);
+    expect(wsProof(token, nonce, sig)).toBe(createHmac('sha256', token).update(`opencli-ws-proof\n${nonce}\n${sig}`).digest('hex'));
+    expect(wsProof(token, nonce, sig)).not.toBe(daemonProof(token, nonce));
+    expect(wsProof(token, nonce, sig)).not.toBe(wsProof(token, nonce, 'ef'.repeat(32)));
   });
 
   it('response proof covers challenge, status and exact body bytes', () => {

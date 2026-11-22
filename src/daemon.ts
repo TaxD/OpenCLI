@@ -31,7 +31,7 @@ import { WebSocketServer, WebSocket, type RawData } from 'ws';
 import { DAEMON_HOST, DEFAULT_DAEMON_PORT, isIgnorableDaemonPortEnv, unsupportedDaemonPortEnvMessage } from './constants.js';
 import { EXIT_CODES } from './errors.js';
 import { log } from './logger.js';
-import { CHALLENGE_RE, NonceCache, PROOF_HEADER, PROOF_NONCE_RE, daemonProof, responseProof, ensureDaemonToken, isAuthorizedExtUpgrade, isAuthorizedRequest } from './daemon-auth.js';
+import { CHALLENGE_RE, NonceCache, PROOF_HEADER, PROOF_NONCE_RE, daemonProof, responseProof, wsProof, ensureDaemonToken, isAuthorizedExtUpgrade, isAuthorizedRequest } from './daemon-auth.js';
 import { PKG_VERSION } from './version.js';
 import { DEFAULT_CONTEXT_ID } from './browser/profile.js';
 import { recordExtensionVersion } from './update-check.js';
@@ -616,8 +616,10 @@ const wss = new WebSocketServer({
   },
 });
 
-wss.on('connection', (ws: WebSocket) => {
+wss.on('connection', (ws: WebSocket, req: IncomingMessage) => {
   log.info('[daemon] Extension connected');
+  // verifyClient already validated this signature; the WS proof is bound to it.
+  const upgradeSig = new URL(req.url ?? '/', 'http://127.0.0.1').searchParams.get('sig') ?? '';
 
   // ── Heartbeat: ping every 15s, close if 2 pongs missed ──
   let missedPongs = 0;
@@ -648,7 +650,7 @@ wss.on('connection', (ws: WebSocket) => {
       // and waits for the proof before trusting anything else on the socket.
       if (msg.type === 'daemon-challenge') {
         if (typeof msg.nonce === 'string' && PROOF_NONCE_RE.test(msg.nonce)) {
-          ws.send(JSON.stringify({ type: 'daemon-proof', proof: daemonProof(DAEMON_TOKEN, msg.nonce) }));
+          ws.send(JSON.stringify({ type: 'daemon-proof', proof: wsProof(DAEMON_TOKEN, msg.nonce, upgradeSig) }));
         }
         return;
       }

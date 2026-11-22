@@ -24,6 +24,7 @@ import { render as renderOutput } from './output.js';
 import { findPackageRoot } from './package-paths.js';
 import { listOpenCliSkills, readOpenCliSkill } from './skills.js';
 import { PKG_VERSION } from './version.js';
+import { isDaemonManaged } from './constants.js';
 
 const CLI_FILE = fileURLToPath(import.meta.url);
 
@@ -151,11 +152,14 @@ export function createProgram(BUILTIN_CLIS: string, USER_CLIS: string): Command 
 
   // ── Plugin management ──────────────────────────────────────────────────────
 
-  const pluginCmd = registerPluginCommands(program);
-
-  const adapterCmd = registerAdapterCommands(program, BUILTIN_CLIS, USER_CLIS);
-
-  const profileCmd = registerProfileCommands(program);
+  // Managed mode (OPENCLI_DAEMON_MANAGED=1): these namespaces install/load
+  // non-built-in code or write user state, so they do not exist at all —
+  // whatever global options precede them, Commander cannot reach them.
+  if (!isDaemonManaged()) {
+    registerPluginCommands(program);
+    registerAdapterCommands(program, BUILTIN_CLIS, USER_CLIS);
+    registerProfileCommands(program);
+  }
 
   const daemonCmd = program.command('daemon').description('Manage the opencli daemon');
   // Snapshot before applyRootSubcommandSummaries() rewrites .description() to a child-name listing.

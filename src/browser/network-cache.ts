@@ -10,6 +10,7 @@
  * Entries expire after DEFAULT_TTL_MS (24h).
  */
 
+import { isDaemonManaged } from '../constants.js';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -58,6 +59,7 @@ export function saveNetworkCache(
     entries: CachedNetworkEntry[],
     baseDir?: string,
 ): void {
+    if (isDaemonManaged()) return; // managed mode never writes user state under HOME
     const target = getCachePath(session, baseDir);
     fs.mkdirSync(path.dirname(target), { recursive: true });
     const payload: NetworkCacheFile = {

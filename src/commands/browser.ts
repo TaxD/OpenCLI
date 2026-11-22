@@ -1,4 +1,5 @@
 import { Command, InvalidArgumentError } from 'commander';
+import { isDaemonManaged } from '../constants.js';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -190,6 +191,7 @@ function loadBrowserTargetState(scope: string): BrowserTargetState | null {
 }
 
 function saveBrowserTargetState(defaultPage: string | undefined, scope: string): void {
+  if (isDaemonManaged()) return; // managed mode never writes user state under HOME
   const target = getBrowserTargetStatePath(scope);
   if (!defaultPage) {
     fs.rmSync(target, { force: true });

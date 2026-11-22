@@ -925,13 +925,21 @@ describe('profile list', () => {
     vi.stubGlobal('fetch', vi.fn());
   });
 
-  it('reports stale daemon instead of no profiles when status lacks profile support', async () => {
-    // The CLI only trusts daemon replies carrying a valid X-OpenCLI-Proof.
+  /** The CLI only trusts daemon replies carrying a valid X-OpenCLI-Proof. */
+  function serveSignedStatus(status: unknown): void {
     const token = 'p'.repeat(64);
     const tokenFile = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'opencli-cli-')), 'daemon-token');
     fs.writeFileSync(tokenFile, token, { mode: 0o600 });
     vi.stubEnv('OPENCLI_DAEMON_TOKEN_FILE', tokenFile);
-    const body = JSON.stringify({
+    const body = JSON.stringify(status);
+    vi.mocked(fetch).mockImplementation(async (_url, init) => new Response(body, {
+      status: 200,
+      headers: { 'X-OpenCLI-Proof': responseProof(token, (init?.headers as Record<string, string>)['X-OpenCLI-Challenge'], 200, body) },
+    }));
+  }
+
+  it('reports stale daemon instead of no profiles when status lacks profile support', async () => {
+    serveSignedStatus({
       ok: true,
       pid: 123,
       uptime: 1,
@@ -942,10 +950,6 @@ describe('profile list', () => {
       memoryMB: 20,
       port: 19825,
     });
-    vi.mocked(fetch).mockImplementation(async (_url, init) => new Response(body, {
-      status: 200,
-      headers: { 'X-OpenCLI-Proof': responseProof(token, (init?.headers as Record<string, string>)['X-OpenCLI-Challenge'], 200, body) },
-    }));
     const program = createProgram('', '');
 
     await program.parseAsync(['node', 'opencli', 'profile', 'list']);
@@ -958,20 +962,17 @@ describe('profile list', () => {
   });
 
   it('keeps the empty profile message for current daemon status with no profiles', async () => {
-    vi.mocked(fetch).mockResolvedValue({
+    serveSignedStatus({
       ok: true,
-      json: async () => ({
-        ok: true,
-        pid: 123,
-        uptime: 1,
-        daemonVersion: PKG_VERSION,
-        extensionConnected: false,
-        profiles: [],
-        pending: 0,
-        memoryMB: 20,
-        port: 19825,
-      }),
-    } as Response);
+      pid: 123,
+      uptime: 1,
+      daemonVersion: PKG_VERSION,
+      extensionConnected: false,
+      profiles: [],
+      pending: 0,
+      memoryMB: 20,
+      port: 19825,
+    });
     const program = createProgram('', '');
 
     await program.parseAsync(['node', 'opencli', 'profile', 'list']);
@@ -979,6 +980,7 @@ describe('profile list', () => {
     const output = stdoutSpy.mock.calls.flat().join('\n');
     expect(JSON.parse(output).data.profiles).toEqual([]);
     expect(output).not.toContain('opencli daemon restart');
+    vi.unstubAllEnvs();
   });
 });
 

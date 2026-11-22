@@ -1,4 +1,5 @@
 import { normalizeOutputFormat } from '../output-format.js';
+import { assertNotManaged } from '../constants.js';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -110,6 +111,7 @@ async function loadAuthRefreshState(statePath: string): Promise<AuthRefreshState
 }
 
 async function saveAuthRefreshState(statePath: string, state: AuthRefreshState): Promise<void> {
+  assertNotManaged('Saving auth refresh state');
   await mkdir(dirname(statePath), { recursive: true });
   await writeFile(statePath, `${JSON.stringify(state, null, 2)}\n`, 'utf8');
 }
@@ -480,6 +482,7 @@ export async function collectAuthStatus(options: AuthStatusOptions): Promise<Aut
 }
 
 export async function collectAuthRefresh(options: AuthRefreshOptions): Promise<AuthRefreshRow[]> {
+  assertNotManaged('opencli auth refresh (it persists state)');
   const selectedSites = parseSiteFilter(options.sites);
   const concurrency = parsePositiveInt(options.concurrency, '--concurrency', 3);
   const timeoutSeconds = parsePositiveInt(options.timeout, '--timeout', 20);

@@ -13,6 +13,7 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import type { IncomingMessage } from 'node:http';
+import { isDaemonManaged } from './constants.js';
 
 const TOKEN_RE = /^[A-Za-z0-9_-]{32,}$/;
 const POSIX = process.platform !== 'win32';
@@ -25,7 +26,12 @@ export class DaemonTokenError extends Error {
 }
 
 export function daemonTokenPath(): string {
-  return process.env.OPENCLI_DAEMON_TOKEN_FILE || path.join(os.homedir(), '.opencli', 'daemon-token');
+  if (process.env.OPENCLI_DAEMON_TOKEN_FILE) return process.env.OPENCLI_DAEMON_TOKEN_FILE;
+  // Managed mode never touches ~/.opencli, not even for the token.
+  if (isDaemonManaged()) {
+    throw new DaemonTokenError('OPENCLI_DAEMON_TOKEN_FILE must be set when OPENCLI_DAEMON_MANAGED=1');
+  }
+  return path.join(os.homedir(), '.opencli', 'daemon-token');
 }
 
 /** Read and validate the token file. Throws DaemonTokenError (never includes the token). */
@@ -134,8 +140,17 @@ export function computeSignature(
   return hmacHex(token, [method.toUpperCase(), pathAndQuery, ts, nonce, bodySha256Hex].join('\n'));
 }
 
+/** `/ping?nonce=` identity proof. */
 export function daemonProof(token: string, nonce: string): string {
   return hmacHex(token, `opencli-daemon-proof\n${nonce}`);
+}
+
+/**
+ * WebSocket identity proof, bound to the connection's own upgrade signature
+ * so a /ping proof (or a proof from another connection) cannot stand in.
+ */
+export function wsProof(token: string, challengeNonce: string, upgradeSig: string): string {
+  return hmacHex(token, `opencli-ws-proof\n${challengeNonce}\n${upgradeSig}`);
 }
 
 export function newNonce(): string {

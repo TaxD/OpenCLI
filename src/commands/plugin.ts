@@ -1,10 +1,12 @@
 import { Command } from 'commander';
+import { assertNotManaged } from '../constants.js';
 import { emitFailure, emitResult } from '../command-output.js';
 import { installCommanderNamespaceStructuredHelp } from '../help.js';
 import { normalizeOutputFormat } from '../output-format.js';
 import { render } from '../output.js';
 
 export function registerPluginCommands(program: Command): Command {
+  assertNotManaged('opencli plugin');
   const plugin = program.command('plugin').description('Manage OpenCLI plugins');
   plugin.command('install').argument('<source>', 'github:user/repo or file://path')
     .description('Install a plugin').action(async source => {

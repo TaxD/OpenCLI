@@ -27,6 +27,7 @@
  *     }
  *   }
  */
+import { assertNotManaged } from '../constants.js';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -124,6 +125,7 @@ export function loadFixture(site: string, command: string): Fixture | null {
 }
 
 export function writeFixture(site: string, command: string, fixture: Fixture): string {
+  assertNotManaged('Writing verify fixtures');
   const p = fixturePath(site, command);
   fs.mkdirSync(path.dirname(p), { recursive: true });
   fs.writeFileSync(p, `${JSON.stringify(fixture, null, 2)}\n`, 'utf-8');

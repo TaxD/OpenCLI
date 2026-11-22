@@ -965,6 +965,47 @@ ${challenge}
 ${status}
 ${bodyHash}`));
 }
+function expectedWsProof(key, challengeNonce, upgradeSig) {
+  return hmacHex(key, `opencli-ws-proof
+${challengeNonce}
+${upgradeSig}`);
+}
+const MAX_PING_RESPONSE_BYTES = 4 * 1024;
+const MAX_DAEMON_RESPONSE_BYTES = 4 * 1024 * 1024;
+async function readCappedBody(res, max) {
+  const declared = Number(res.headers?.get("content-length"));
+  if (Number.isFinite(declared) && declared > max) {
+    await res.body?.cancel().catch(() => {
+    });
+    return null;
+  }
+  if (!res.body) return new ArrayBuffer(0);
+  const reader = res.body.getReader();
+  const chunks = [];
+  let total = 0;
+  try {
+    for (; ; ) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > max) {
+        await reader.cancel().catch(() => {
+        });
+        return null;
+      }
+      chunks.push(value);
+    }
+  } catch {
+    return null;
+  }
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const c of chunks) {
+    out.set(c, offset);
+    offset += c.byteLength;
+  }
+  return out.buffer;
+}
 
 let ws = null;
 let reconnectTimer = null;
@@ -1118,7 +1159,13 @@ async function connectAttempt() {
       scheduleReconnect();
       return;
     }
-    const body = await res.json().catch(() => null);
+    const raw = await readCappedBody(res, MAX_PING_RESPONSE_BYTES);
+    let body = null;
+    try {
+      body = raw ? JSON.parse(new TextDecoder().decode(raw)) : null;
+    } catch {
+      body = null;
+    }
     if (typeof body?.proof !== "string" || !constantTimeEqual(body.proof, await expectedDaemonProof(key, pingNonce))) {
       console.warn("[opencli] process on the daemon port failed the identity proof; not connecting");
       scheduleReconnect();
@@ -1131,10 +1178,12 @@ async function connectAttempt() {
   }
   if (isDaemonSocketActive()) return;
   let thisWs;
+  let upgradeSig;
   try {
     const contextId = await getCurrentContextId();
     if (isDaemonSocketActive()) return;
     const sig = await signParts(key, "GET", "/ext");
+    upgradeSig = sig.sig;
     if (isDaemonSocketActive()) return;
     thisWs = new WebSocket(`${DAEMON_WS_URL}?ts=${sig.ts}&nonce=${sig.nonce}&sig=${sig.sig}`);
     ws = thisWs;
@@ -1191,7 +1240,7 @@ async function connectAttempt() {
         if (msg?.type === "daemon-proof") proof = msg.proof;
       } catch {
       }
-      const ok = !!nonce && typeof proof === "string" && constantTimeEqual(proof, await expectedDaemonProof(key, nonce));
+      const ok = !!nonce && typeof proof === "string" && constantTimeEqual(proof, await expectedWsProof(key, nonce, upgradeSig));
       if (!ok) {
         rejectDaemon("daemon failed the identity proof");
         return;
@@ -1997,8 +2046,8 @@ async function fetchDaemonVersion() {
       console.warn("[opencli] unauthenticated redirect from the daemon port; ignoring it");
       return null;
     }
-    const raw = await res.arrayBuffer();
-    if (!await verifyResponseProof(key, challenge, res.status, raw, res.headers.get("X-OpenCLI-Proof"))) {
+    const raw = await readCappedBody(res, MAX_DAEMON_RESPONSE_BYTES);
+    if (!raw || !await verifyResponseProof(key, challenge, res.status, raw, res.headers.get("X-OpenCLI-Proof"))) {
       console.warn("[opencli] unauthenticated /status reply on the daemon port; ignoring it");
       return null;
     }

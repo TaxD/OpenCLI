@@ -2,6 +2,8 @@
  * Shared constants used across explore, synthesize, and pipeline modules.
  */
 
+import { CliError, EXIT_CODES } from './errors.js';
+
 /** Default daemon port for HTTP/WebSocket communication with browser extension */
 export const DEFAULT_DAEMON_PORT = 19825;
 
@@ -22,6 +24,20 @@ export const DAEMON_HOST = '127.0.0.1';
  */
 export function isDaemonManaged(): boolean {
   return process.env.OPENCLI_DAEMON_MANAGED === '1';
+}
+
+/**
+ * Last line of defence for managed mode: call right before loading
+ * non-built-in code or writing user state. Throws a CONFIG CliError.
+ */
+export function assertNotManaged(action: string): void {
+  if (!isDaemonManaged()) return;
+  throw new CliError(
+    'CONFIG',
+    `${action} is disabled when OPENCLI_DAEMON_MANAGED=1`,
+    'Managed mode runs built-in code only and does not write user state under HOME.',
+    EXIT_CODES.CONFIG_ERROR,
+  );
 }
 
 export function unsupportedDaemonPortEnvMessage(value?: string): string {

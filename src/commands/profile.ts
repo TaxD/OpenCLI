@@ -1,4 +1,5 @@
 import { Command } from 'commander';
+import { assertNotManaged } from '../constants.js';
 import { fetchDaemonStatus } from '../browser/daemon-transport.js';
 import { isDaemonStale } from '../browser/daemon-version.js';
 import { aliasForContextId, loadProfileConfig, renameProfile, setDefaultProfile } from '../browser/profile.js';
@@ -7,6 +8,7 @@ import { installCommanderNamespaceStructuredHelp } from '../help.js';
 import { PKG_VERSION } from '../version.js';
 
 export function registerProfileCommands(program: Command): Command {
+  assertNotManaged('opencli profile');
   const profile = program.command('profile').description('Manage Chrome profiles');
   profile.command('list').description('List connected and saved Chrome profiles').action(async () => {
     const status = await fetchDaemonStatus();

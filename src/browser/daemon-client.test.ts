@@ -19,10 +19,12 @@ import type { AddressInfo } from 'node:net';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import * as daemonLifecycle from './daemon-lifecycle.js';
-import { UnauthenticatedDaemonError, requestDaemon } from './daemon-transport.js';
+import { MAX_DAEMON_RESPONSE_BYTES, UnauthenticatedDaemonError, requestDaemon } from './daemon-transport.js';
 import { responseProof } from '../daemon-auth.js';
 
 const realFetch = globalThis.fetch;
+/** What undici throws when nothing listens on the port. */
+const refused = () => new TypeError('fetch failed', { cause: Object.assign(new Error('connect ECONNREFUSED 127.0.0.1:19825'), { code: 'ECONNREFUSED' }) });
 const TEST_TOKEN = 't'.repeat(64);
 const SIGNED = /^OpenCLI-HMAC ts=\d+;nonce=[0-9a-f]{32};sig=[0-9a-f]{64}$/;
 
@@ -182,6 +184,48 @@ describe('daemon-client', () => {
       }
     });
 
+    /** Retarget real undici fetch from the daemon port to a local test server. */
+    const retarget = (port: number) => vi.stubGlobal('fetch', vi.fn((url: string, init?: RequestInit) =>
+      realFetch(String(url).replace(':19825', `:${port}`), init)));
+    const listen = async (handler: Parameters<typeof createServer>[1]) => {
+      const server = createServer(handler);
+      await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+      return { server, port: (server.address() as AddressInfo).port, close: () => new Promise((r) => server.close(r)) };
+    };
+
+    it.each([
+      ['an oversized Content-Length', () => new Response('{}', { headers: { 'Content-Length': String(MAX_DAEMON_RESPONSE_BYTES + 1) } })],
+      ['an endless body', () => new Response(new ReadableStream({ pull(c) { c.enqueue(new Uint8Array(1024 * 1024)); } }))],
+      ['a body that errors mid-stream', () => new Response(new ReadableStream({ start(c) { c.enqueue(new Uint8Array(8)); c.error(new Error('reset')); } }))],
+    ] as const)('treats %s as unauthenticated (never "stopped"): no spawn', async (_label, make) => {
+      vi.stubGlobal('fetch', vi.fn(async () => make()));
+      const spawnSpy = vi.spyOn(daemonLifecycle.daemonLifecycleHooks, 'spawnDaemonProcess').mockImplementation(() => { throw new Error('spawned'); });
+      await expect(fetchDaemonStatus()).rejects.toBeInstanceOf(UnauthenticatedDaemonError);
+      await expect(requestDaemon('/command', { method: 'POST', body: '{}' })).rejects.toBeInstanceOf(UnauthenticatedDaemonError);
+      await expect(daemonLifecycle.ensureBrowserBridgeReady({ timeoutSeconds: 1, verbose: false })).rejects.toBeInstanceOf(UnauthenticatedDaemonError);
+      expect(spawnSpy).not.toHaveBeenCalled();
+    });
+
+    it('a connection that is accepted then dropped is unauthenticated, not "no daemon"', async () => {
+      const { port, close } = await listen((req) => { req.socket.destroy(); });
+      retarget(port);
+      const spawnSpy = vi.spyOn(daemonLifecycle.daemonLifecycleHooks, 'spawnDaemonProcess').mockImplementation(() => { throw new Error('spawned'); });
+      try {
+        await expect(fetchDaemonStatus()).rejects.toBeInstanceOf(UnauthenticatedDaemonError);
+        await expect(getDaemonHealth()).rejects.toBeInstanceOf(UnauthenticatedDaemonError);
+        await expect(daemonLifecycle.ensureBrowserBridgeReady({ timeoutSeconds: 1, verbose: false })).rejects.toBeInstanceOf(UnauthenticatedDaemonError);
+        expect(spawnSpy).not.toHaveBeenCalled();
+      } finally { await close(); }
+    });
+
+    it('only a refused connection (nothing listening) means "stopped"', async () => {
+      const { port, close } = await listen(() => {});
+      await close(); // port now refuses connections
+      retarget(port);
+      await expect(fetchDaemonStatus()).resolves.toBeNull();
+      await expect(getDaemonHealth()).resolves.toEqual({ state: 'stopped', status: null });
+    });
+
     it('accepts only the exact status code and body the proof covers', async () => {
       const body = JSON.stringify(forgedStatus);
       impostor((init) => responseProof(TEST_TOKEN, challengeOf(init), 200, body), body);
@@ -211,7 +255,7 @@ describe('daemon-client', () => {
     beforeEach(() => { vi.stubEnv('OPENCLI_DAEMON_MANAGED', '1'); });
 
     it('fails fast without spawning when no daemon is running', async () => {
-      daemonFetch.mockRejectedValue(new TypeError('fetch failed'));
+      daemonFetch.mockRejectedValue(refused());
       const spawnSpy = vi.spyOn(daemonLifecycle.daemonLifecycleHooks, 'spawnDaemonProcess');
       await expect(daemonLifecycle.ensureBrowserBridgeReady({ timeoutSeconds: 1, verbose: false }))
         .rejects.toThrow(/OPENCLI_DAEMON_MANAGED=1/);
@@ -245,7 +289,7 @@ describe('daemon-client', () => {
   });
 
   it('fetchDaemonStatus returns null on network failure', async () => {
-    daemonFetch.mockRejectedValue(new Error('ECONNREFUSED'));
+    daemonFetch.mockRejectedValue(refused());
 
     await expect(fetchDaemonStatus()).resolves.toBeNull();
   });
@@ -265,7 +309,7 @@ describe('daemon-client', () => {
   });
 
   it('getDaemonHealth returns stopped when daemon is not reachable', async () => {
-    daemonFetch.mockRejectedValue(new Error('ECONNREFUSED'));
+    daemonFetch.mockRejectedValue(refused());
 
     await expect(getDaemonHealth()).resolves.toEqual({ state: 'stopped', status: null });
   });

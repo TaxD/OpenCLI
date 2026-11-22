@@ -38,6 +38,9 @@ async function refHmac(data: string, token = TEST_DAEMON_TOKEN): Promise<string>
   return hexOf(await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(data)));
 }
 const daemonProof = (nonce: string, token = TEST_DAEMON_TOKEN) => refHmac(`opencli-daemon-proof\n${nonce}`, token);
+/** The daemon's WS proof: bound to the socket's own upgrade signature. */
+const wsProof = (socket: { url: string }, nonce: string, token = TEST_DAEMON_TOKEN) =>
+  refHmac(`opencli-ws-proof\n${nonce}\n${new URL(socket.url).searchParams.get('sig')}`, token);
 
 /**
  * Serve extension/daemon-token.json; every other fetch goes to `daemonFetch`.
@@ -54,12 +57,16 @@ function withDaemonToken<F extends (...args: any[]) => any>(
     const res = await daemonFetch(url, init);
     const nonce = new URL(String(url)).searchParams.get('nonce');
     if (!nonce || !res?.ok) return res;
-    return { ...res, json: async () => ({ ok: true, proof: proof ? proof(nonce) : await daemonProof(nonce) }) };
+    // A real Response: the extension streams ping bodies with a size cap.
+    return new Response(JSON.stringify({ ok: true, proof: proof ? await proof(nonce) : await daemonProof(nonce) }), { status: 200 });
   });
 }
 
 /** Play the real daemon's side of the WS identity challenge. */
-async function completeDaemonHandshake(socket: MockWebSocket, answer: (nonce: string) => unknown = daemonProof): Promise<void> {
+async function completeDaemonHandshake(
+  socket: MockWebSocket,
+  answer: (nonce: string) => unknown = (nonce) => wsProof(socket, nonce),
+): Promise<void> {
   socket.readyState = MockWebSocket.OPEN;
   socket.onopen?.();
   const challenge = socket.sent.map((e) => JSON.parse(e)).find((m) => m.type === 'daemon-challenge');
@@ -1453,7 +1460,7 @@ describe('background tab isolation', () => {
     // Only the challenge goes out before the proof.
     expect(socket.sent.map((e) => JSON.parse(e).type)).toEqual(['daemon-challenge']);
     const challenge = JSON.parse(socket.sent[0]).nonce;
-    await socket.onmessage?.({ data: JSON.stringify({ type: 'daemon-proof', proof: await daemonProof(challenge) }) });
+    await socket.onmessage?.({ data: JSON.stringify({ type: 'daemon-proof', proof: await wsProof(socket, challenge) }) });
     await vi.waitFor(() => {
       expect(socket.sent.some((e) => JSON.parse(e).type === 'hello')).toBe(true);
     });
@@ -1466,6 +1473,63 @@ describe('background tab isolation', () => {
       chrome.storage.session.set.mock.calls,
     ]);
     expect(everythingSent).not.toContain(TEST_DAEMON_TOKEN);
+  });
+
+  it.each([
+    ['the /ping-style proof for the same nonce', (socket: MockWebSocket, nonce: string) => daemonProof(nonce)],
+    ['a WS proof bound to a different upgrade signature', (_socket: MockWebSocket, nonce: string) =>
+      refHmac(`opencli-ws-proof\n${nonce}\n${'0'.repeat(64)}`)],
+  ] as const)('rejects %s as the WebSocket proof', async (_label, answer) => {
+    const { chrome } = createChromeMock();
+    vi.stubGlobal('chrome', chrome);
+    vi.stubGlobal('fetch', withDaemonToken(vi.fn(async () => ({ ok: true }))));
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    const mod = await import('./background');
+    await mod.__test__.connectForTest();
+    const socket = MockWebSocket.instances[0];
+    await completeDaemonHandshake(socket, (nonce) => answer(socket, nonce));
+
+    expect(socket.readyState).toBe(MockWebSocket.CLOSED);
+    expect(socket.sent.map((e) => JSON.parse(e).type)).toEqual(['daemon-challenge']);
+  });
+
+  it.each([
+    ['a body over 4 KiB', () => new Response('x'.repeat(4 * 1024 + 1), { status: 200 })],
+    ['an oversized Content-Length', () => new Response('{}', { status: 200, headers: { 'Content-Length': String(10 * 1024 * 1024) } })],
+    ['a body stream that errors', () => new Response(new ReadableStream({ start(c) { c.error(new Error('reset')); } }), { status: 200 })],
+  ] as const)('does not connect when /ping answers with %s', async (_label, make) => {
+    const { chrome } = createChromeMock();
+    vi.stubGlobal('chrome', chrome);
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => String(url).endsWith('/daemon-token.json')
+      ? { ok: true, status: 200, json: async () => ({ token: TEST_DAEMON_TOKEN }) }
+      : make()));
+
+    const mod = await import('./background');
+    await mod.__test__.connectForTest();
+    expect(MockWebSocket.instances).toHaveLength(0);
+  });
+
+  it('ignores a /status reply over 4 MiB without parsing it', async () => {
+    const { chrome } = createChromeMock();
+    vi.stubGlobal('chrome', chrome);
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    vi.stubGlobal('fetch', withDaemonToken(vi.fn(async (url: string) => String(url).endsWith('/status')
+      ? new Response(new ReadableStream({
+        pull(c) { c.enqueue(new Uint8Array(1024 * 1024).fill(0x20)); },
+      }), { status: 200 })
+      : { ok: true })));
+
+    const mod = await import('./background');
+    await mod.__test__.connectForTest();
+    await completeDaemonHandshake(MockWebSocket.instances[0]);
+    const onMessageListener = chrome.runtime.onMessage.addListener.mock.calls[0][0];
+    const sendResponse = vi.fn();
+    onMessageListener({ type: 'getStatus' }, {}, sendResponse);
+    await vi.waitFor(() => {
+      expect(sendResponse).toHaveBeenCalledWith(expect.objectContaining({ connected: true, daemonVersion: null }));
+    });
   });
 
   it('closes without hello or command handling when the daemon answers the challenge wrongly', async () => {

@@ -1,4 +1,5 @@
 import * as fs from 'node:fs';
+import { assertNotManaged } from '../constants.js';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import type { ObservationEvent, ObservationExportResult, ObservationExportStatus, ObservationTraceReceipt } from './events.js';
@@ -30,6 +31,7 @@ export function getTraceDirectory(contextId: string | undefined, traceId: string
 }
 
 export function exportObservationSession(session: ObservationSession, opts: ExportObservationOptions = {}): ObservationExportResult {
+  assertNotManaged('Writing trace artifacts');
   const dir = getTraceDirectory(session.scope.contextId, session.id, opts.baseDir);
   const status = opts.status ?? (opts.error === undefined ? 'success' : 'failure');
   const createdAt = new Date().toISOString();

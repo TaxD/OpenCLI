@@ -433,13 +433,18 @@ describe('daemon transport contracts (real daemon)', () => {
     expect(await dial(`?token=${TOKEN}`)).toBeNull();
     expect(await dial(signedExtQuery('x'.repeat(64)))).toBeNull();
 
-    const ws = await dial(signedExtQuery());
+    const query = signedExtQuery();
+    const upgradeSig = new URLSearchParams(query.slice(1)).get('sig')!;
+    const ws = await dial(query);
     expect(ws).not.toBeNull();
     try {
       const nonce = randomBytes(16).toString('hex');
       const reply = new Promise<any>((resolve) => ws!.once('message', (raw) => resolve(JSON.parse(raw.toString()))));
       ws!.send(JSON.stringify({ type: 'daemon-challenge', nonce }));
-      expect(await reply).toEqual({ type: 'daemon-proof', proof: hmac(`opencli-daemon-proof\n${nonce}`) });
+      const { proof } = await reply;
+      // Bound to this connection's upgrade signature, distinct from the /ping proof.
+      expect(proof).toBe(hmac(`opencli-ws-proof\n${nonce}\n${upgradeSig}`));
+      expect(proof).not.toBe(hmac(`opencli-daemon-proof\n${nonce}`));
     } finally {
       ws!.close();
     }

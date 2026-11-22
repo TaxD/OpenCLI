@@ -64,3 +64,46 @@ export async function verifyResponseProof(
   const bodyHash = toHex(await crypto.subtle.digest('SHA-256', body));
   return constantTimeEqual(proof, await hmacHex(key, `opencli-response\n${challenge}\n${status}\n${bodyHash}`));
 }
+
+/** WebSocket identity proof, bound to this connection's upgrade signature. */
+export function expectedWsProof(key: CryptoKey, challengeNonce: string, upgradeSig: string): Promise<string> {
+  return hmacHex(key, `opencli-ws-proof\n${challengeNonce}\n${upgradeSig}`);
+}
+
+/** Size caps for daemon replies read before they are authenticated. */
+export const MAX_PING_RESPONSE_BYTES = 4 * 1024;
+export const MAX_DAEMON_RESPONSE_BYTES = 4 * 1024 * 1024;
+
+/**
+ * Stream a response body, giving up past `max` bytes. Returns null when the
+ * body is too large or cannot be read — callers treat that as unauthenticated.
+ */
+export async function readCappedBody(res: Response, max: number): Promise<ArrayBuffer | null> {
+  const declared = Number(res.headers?.get('content-length'));
+  if (Number.isFinite(declared) && declared > max) {
+    await res.body?.cancel().catch(() => {});
+    return null;
+  }
+  if (!res.body) return new ArrayBuffer(0);
+  const reader = res.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > max) {
+        await reader.cancel().catch(() => {});
+        return null;
+      }
+      chunks.push(value);
+    }
+  } catch {
+    return null;
+  }
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const c of chunks) { out.set(c, offset); offset += c.byteLength; }
+  return out.buffer;
+}

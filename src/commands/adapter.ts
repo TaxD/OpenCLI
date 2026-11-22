@@ -1,4 +1,5 @@
 import { Command } from 'commander';
+import { assertNotManaged } from '../constants.js';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -103,6 +104,7 @@ export function normalizeVerifyRows(data: unknown): Record<string, unknown>[] {
 }
 
 export function registerAdapterCommands(program: Command, BUILTIN_CLIS: string, USER_CLIS: string): Command {
+  assertNotManaged('opencli adapter');
   // ── Built-in: adapter management ─────────────────────────────────────────
   const adapterCmd = program.command('adapter').description('Manage CLI adapters');
   // Snapshot before applyRootSubcommandSummaries() rewrites .description() to a child-name listing.

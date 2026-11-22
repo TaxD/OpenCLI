@@ -63,6 +63,7 @@ function readCacheSync(): UpdateCache | null {
 const _cache: UpdateCache | null = readCacheSync();
 
 function writeCacheMerge(updates: Partial<UpdateCache>): void {
+  if (isDaemonManaged()) return; // managed mode never writes ~/.opencli
   try {
     fs.mkdirSync(CACHE_DIR, { recursive: true });
     const existing = readCacheSync() ?? {};

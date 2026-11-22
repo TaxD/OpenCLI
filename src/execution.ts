@@ -10,6 +10,7 @@
  * 6. Lifecycle hooks (onBeforeExecute / onAfterExecute)
  */
 
+import { assertNotManaged } from './constants.js';
 import {
   type BrowserCliCommand,
   type CliCommand,
@@ -241,6 +242,7 @@ export async function executeCommand(
   // leaks into this one.
   setDaemonCommandTimeoutSeconds(userTimeoutSec);
   const traceMode = normalizeTraceMode(opts.trace);
+  if (traceMode !== 'off') assertNotManaged('--trace');
 
   const hookCtx: HookContext = {
     command: fullName(cmd),

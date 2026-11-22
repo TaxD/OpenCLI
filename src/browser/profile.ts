@@ -1,4 +1,5 @@
 import * as fs from 'node:fs';
+import { assertNotManaged } from '../constants.js';
 import * as os from 'node:os';
 import * as path from 'node:path';
 
@@ -48,6 +49,7 @@ export function loadProfileConfig(): ProfileConfig {
 }
 
 export function saveProfileConfig(config: ProfileConfig): void {
+  assertNotManaged('Saving browser profile config');
   const target = profileConfigPath();
   fs.mkdirSync(path.dirname(target), { recursive: true });
   fs.writeFileSync(target, JSON.stringify(config, null, 2) + '\n', 'utf-8');

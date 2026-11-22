@@ -14,7 +14,10 @@ import { findIdleInteractiveGroup, idlePlaceholderUrl, parkIdleInteractiveTab, c
 import * as executor from './cdp';
 import * as identity from './identity';
 import { executeWithJournal } from './journal';
-import { authorizationHeader, constantTimeEqual, expectedDaemonProof, importDaemonKey, randomNonce, signParts, verifyResponseProof } from './daemon-auth';
+import {
+  MAX_DAEMON_RESPONSE_BYTES, MAX_PING_RESPONSE_BYTES, authorizationHeader, constantTimeEqual, expectedDaemonProof, expectedWsProof,
+  importDaemonKey, randomNonce, readCappedBody, signParts, verifyResponseProof,
+} from './daemon-auth';
 
 let ws: WebSocket | null = null;
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
@@ -218,8 +221,11 @@ async function connectAttempt(): Promise<void> {
       scheduleReconnect();
       return; // unexpected response — not our daemon, but keep polling.
     }
-    // Only a process holding the token can answer the nonce.
-    const body = await res.json().catch(() => null) as { proof?: unknown } | null;
+    // Only a process holding the token can answer the nonce. Read at most
+    // MAX_PING_RESPONSE_BYTES before deciding.
+    const raw = await readCappedBody(res, MAX_PING_RESPONSE_BYTES);
+    let body: { proof?: unknown } | null = null;
+    try { body = raw ? JSON.parse(new TextDecoder().decode(raw)) : null; } catch { body = null; }
     if (typeof body?.proof !== 'string' || !constantTimeEqual(body.proof, await expectedDaemonProof(key, pingNonce))) {
       console.warn('[opencli] process on the daemon port failed the identity proof; not connecting');
       scheduleReconnect();
@@ -237,10 +243,12 @@ async function connectAttempt(): Promise<void> {
   if (isDaemonSocketActive()) return;
 
   let thisWs: WebSocket;
+  let upgradeSig: string;
   try {
     const contextId = await getCurrentContextId();
     if (isDaemonSocketActive()) return;
     const sig = await signParts(key, 'GET', '/ext');
+    upgradeSig = sig.sig;
     if (isDaemonSocketActive()) return;
     thisWs = new WebSocket(`${DAEMON_WS_URL}?ts=${sig.ts}&nonce=${sig.nonce}&sig=${sig.sig}`);
     ws = thisWs;
@@ -250,7 +258,8 @@ async function connectAttempt(): Promise<void> {
     return;
   }
 
-  // Identity challenge: until the daemon answers with HMAC(key, nonce) we send
+  // Identity challenge: until the daemon answers with
+  // HMAC(key, "opencli-ws-proof\n" + nonce + "\n" + upgradeSig) we send
   // nothing (no hello, logs or results) and act on nothing it sends.
   let challenge: string | null = null;
   let proofTimer: ReturnType<typeof setTimeout> | null = null;
@@ -307,7 +316,7 @@ async function connectAttempt(): Promise<void> {
         const msg = JSON.parse(event.data as string) as { type?: unknown; proof?: unknown };
         if (msg?.type === 'daemon-proof') proof = msg.proof;
       } catch { /* treated as a failed proof */ }
-      const ok = !!nonce && typeof proof === 'string' && constantTimeEqual(proof, await expectedDaemonProof(key, nonce));
+      const ok = !!nonce && typeof proof === 'string' && constantTimeEqual(proof, await expectedWsProof(key, nonce, upgradeSig));
       if (!ok) {
         rejectDaemon('daemon failed the identity proof');
         return;
@@ -1449,9 +1458,9 @@ async function fetchDaemonVersion(): Promise<string | null> {
       console.warn('[opencli] unauthenticated redirect from the daemon port; ignoring it');
       return null;
     }
-    // Use nothing from a reply the daemon did not authenticate.
-    const raw = await res.arrayBuffer();
-    if (!await verifyResponseProof(key, challenge, res.status, raw, res.headers.get('X-OpenCLI-Proof'))) {
+    // Use nothing from a reply the daemon did not authenticate (read capped).
+    const raw = await readCappedBody(res, MAX_DAEMON_RESPONSE_BYTES);
+    if (!raw || !await verifyResponseProof(key, challenge, res.status, raw, res.headers.get('X-OpenCLI-Proof'))) {
       console.warn('[opencli] unauthenticated /status reply on the daemon port; ignoring it');
       return null;
     }
