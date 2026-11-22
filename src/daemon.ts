@@ -31,7 +31,7 @@ import { WebSocketServer, WebSocket, type RawData } from 'ws';
 import { DAEMON_HOST, DEFAULT_DAEMON_PORT, isIgnorableDaemonPortEnv, unsupportedDaemonPortEnvMessage } from './constants.js';
 import { EXIT_CODES } from './errors.js';
 import { log } from './logger.js';
-import { NonceCache, PROOF_NONCE_RE, daemonProof, ensureDaemonToken, isAuthorizedExtUpgrade, isAuthorizedRequest } from './daemon-auth.js';
+import { CHALLENGE_RE, NonceCache, PROOF_HEADER, PROOF_NONCE_RE, daemonProof, responseProof, ensureDaemonToken, isAuthorizedExtUpgrade, isAuthorizedRequest } from './daemon-auth.js';
 import { PKG_VERSION } from './version.js';
 import { DEFAULT_CONTEXT_ID } from './browser/profile.js';
 import { recordExtensionVersion } from './update-check.js';
@@ -265,14 +265,22 @@ function readBody(req: IncomingMessage): Promise<Buffer> {
   });
 }
 
+/** Valid X-OpenCLI-Challenge of the request each response answers. */
+const responseChallenges = new WeakMap<ServerResponse, string>();
+
 function jsonResponse(
   res: ServerResponse,
   status: number,
   data: unknown,
   extraHeaders?: Record<string, string>,
 ): void {
-  res.writeHead(status, { 'Content-Type': 'application/json', ...extraHeaders });
-  res.end(JSON.stringify(data));
+  const body = Buffer.from(JSON.stringify(data), 'utf-8');
+  // Authenticate the response to the client (status + exact body bytes), so
+  // an impostor on the port cannot feed the CLI a forged status/pid/version.
+  const challenge = responseChallenges.get(res);
+  const proof = challenge ? { [PROOF_HEADER]: responseProof(DAEMON_TOKEN, challenge, status, body) } : {};
+  res.writeHead(status, { 'Content-Type': 'application/json', ...extraHeaders, ...proof });
+  res.end(body);
 }
 
 async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {
@@ -587,7 +595,14 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
 
 // ─── WebSocket for Extension ─────────────────────────────────────────
 
-const httpServer = createServer((req, res) => { handleRequest(req, res).catch(() => { res.writeHead(500); res.end(); }); });
+const httpServer = createServer((req, res) => {
+  const challenge = req.headers['x-opencli-challenge'];
+  if (typeof challenge === 'string' && CHALLENGE_RE.test(challenge)) responseChallenges.set(res, challenge);
+  handleRequest(req, res).catch(() => {
+    if (!res.headersSent) jsonResponse(res, 500, { ok: false, error: 'Internal error' });
+    else res.end();
+  });
+});
 const wss = new WebSocketServer({
   server: httpServer,
   path: '/ext',

@@ -1,6 +1,6 @@
 {
   "name": "@jackwener/opencli",
-  "version": "2.0.3-reach.2",
+  "version": "2.0.3-reach.3",
   "publishConfig": {
     "access": "public",
     "provenance": true
@@ -50,7 +50,7 @@
     "clean-dist": "node scripts/clean-dist.cjs",
     "start": "node dist/src/main.js",
     "start:bun": "bun dist/src/main.js",
-    "preuninstall": "node -e \"const c=require('crypto');let h={'X-OpenCLI':'1'};try{const f=process.env.OPENCLI_DAEMON_TOKEN_FILE||require('path').join(require('os').homedir(),'.opencli','daemon-token');const k=require('fs').readFileSync(f,'utf8').trim(),t=String(Date.now()),n=c.randomBytes(16).toString('hex');const s=c.createHmac('sha256',k).update(['POST','/shutdown',t,n,c.createHash('sha256').update('').digest('hex')].join('\\n')).digest('hex');h.Authorization='OpenCLI-HMAC ts='+t+';nonce='+n+';sig='+s}catch{}fetch('http://127.0.0.1:19825/shutdown',{method:'POST',headers:h,signal:AbortSignal.timeout(3000)}).catch(()=>{})\" || true",
+    "preuninstall": "node -e \"const c=require('crypto');let h={'X-OpenCLI':'1'};try{const f=process.env.OPENCLI_DAEMON_TOKEN_FILE||require('path').join(require('os').homedir(),'.opencli','daemon-token');const k=require('fs').readFileSync(f,'utf8').trim(),t=String(Date.now()),n=c.randomBytes(16).toString('hex');const s=c.createHmac('sha256',k).update(['POST','/shutdown',t,n,c.createHash('sha256').update('').digest('hex')].join('\\n')).digest('hex');h.Authorization='OpenCLI-HMAC ts='+t+';nonce='+n+';sig='+s}catch{}process.env.OPENCLI_DAEMON_MANAGED==='1'||fetch('http://127.0.0.1:19825/shutdown',{method:'POST',headers:h,signal:AbortSignal.timeout(3000)}).catch(()=>{})\" || true",
     "postinstall": "node scripts/postinstall.js || true; node scripts/fetch-adapters.js || true",
     "typecheck": "tsc --noEmit",
     "prepare": "node scripts/prepare.cjs",

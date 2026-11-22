@@ -131,6 +131,29 @@ export function newNonce(): string {
   return crypto.randomBytes(16).toString('hex');
 }
 
+// ─── Response authentication ─────────────────────────────────────────
+// The client sends X-OpenCLI-Challenge; the daemon answers with
+// X-OpenCLI-Proof = HMAC(key, "opencli-response\n" + challenge + "\n" +
+// status + "\n" + sha256hex(body)). Prefix differs from request signatures
+// (which start with an upper-case METHOD) and from the daemon identity proof.
+
+export const CHALLENGE_HEADER = 'X-OpenCLI-Challenge';
+export const PROOF_HEADER = 'X-OpenCLI-Proof';
+export const CHALLENGE_RE = /^[0-9a-f]{32}$/;
+
+export function responseProof(token: string, challenge: string, status: number, body: string | Uint8Array): string {
+  return hmacHex(token, `opencli-response\n${challenge}\n${status}\n${sha256Hex(body)}`);
+}
+
+export function verifyResponseProof(
+  token: string, challenge: string, status: number, body: string | Uint8Array, proof: unknown,
+): boolean {
+  if (typeof proof !== 'string' || !SIG_RE.test(proof)) return false;
+  const expected = Buffer.from(responseProof(token, challenge, status, body), 'utf-8');
+  const provided = Buffer.from(proof, 'utf-8');
+  return expected.length === provided.length && crypto.timingSafeEqual(expected, provided);
+}
+
 /** Fresh ts/nonce/sig for one request. `pathAndQuery` must be exactly what goes on the wire. */
 export function signParts(token: string, method: string, pathAndQuery: string, body?: string | Uint8Array): SignatureParts {
   const ts = String(Date.now());

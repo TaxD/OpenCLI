@@ -386,6 +386,31 @@ describe('daemon transport contracts (real daemon)', () => {
     expect(ok).toEqual({ status: 200, result: { id: 'signed-release', ok: true } });
   });
 
+  it('authenticates responses for a valid X-OpenCLI-Challenge (status + exact body), including 401s', async () => {
+    if (guard()) return;
+    const verify = async (res: Response, challenge: string) => {
+      const body = Buffer.from(await res.arrayBuffer());
+      const proof = res.headers.get('x-opencli-proof');
+      expect(proof).toBe(hmac(`opencli-response\n${challenge}\n${res.status}\n${createHash('sha256').update(body).digest('hex')}`));
+      return body;
+    };
+    const challenge = randomBytes(16).toString('hex');
+    const ok = await fetch(`${BASE}/status`, { headers: { ...signedHeaders('GET', '/status'), 'X-OpenCLI-Challenge': challenge }, signal: AbortSignal.timeout(2_000) });
+    expect(ok.status).toBe(200);
+    expect(JSON.parse((await verify(ok, challenge)).toString()).ok).toBe(true);
+
+    const c401 = randomBytes(16).toString('hex');
+    const denied = await fetch(`${BASE}/status`, { headers: { 'X-OpenCLI': '1', 'X-OpenCLI-Challenge': c401 }, signal: AbortSignal.timeout(2_000) });
+    expect(denied.status).toBe(401);
+    await verify(denied, c401);
+
+    for (const bad of [undefined, 'xyz', 'AB'.repeat(16)]) {
+      const res = await fetch(`${BASE}/status`, { headers: { ...signedHeaders('GET', '/status'), ...(bad ? { 'X-OpenCLI-Challenge': bad } : {}) }, signal: AbortSignal.timeout(2_000) });
+      expect(res.headers.get('x-opencli-proof'), String(bad)).toBeNull();
+      await res.arrayBuffer();
+    }
+  });
+
   it('/ping?nonce= returns HMAC proof; a malformed nonce gets 400', async () => {
     if (guard()) return;
     const nonce = randomBytes(24).toString('hex');

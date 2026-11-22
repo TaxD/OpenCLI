@@ -16,7 +16,9 @@ import {
   isAuthorizedRequest,
   readDaemonToken,
   readDaemonTokenOrNull,
+  responseProof,
   signParts,
+  verifyResponseProof,
 } from './daemon-auth.js';
 
 const posix = process.platform !== 'win32';
@@ -97,6 +99,22 @@ describe('signature primitives', () => {
     expect(p.sig).toBe(refSig(token, 'POST', '/command', p.ts, p.nonce, '{"a":1}'));
     const nonce = 'ab'.repeat(16);
     expect(daemonProof(token, nonce)).toBe(createHmac('sha256', token).update(`opencli-daemon-proof\n${nonce}`).digest('hex'));
+  });
+
+  it('response proof covers challenge, status and exact body bytes', () => {
+    const token = 'k'.repeat(64);
+    const challenge = 'cd'.repeat(16);
+    const body = '{"ok":true,"pid":1}';
+    const proof = responseProof(token, challenge, 200, body);
+    expect(proof).toBe(createHmac('sha256', token)
+      .update(`opencli-response\n${challenge}\n200\n${createHash('sha256').update(body).digest('hex')}`).digest('hex'));
+    expect(verifyResponseProof(token, challenge, 200, Buffer.from(body), proof)).toBe(true);
+    expect(verifyResponseProof(token, challenge, 201, body, proof)).toBe(false);
+    expect(verifyResponseProof(token, challenge, 200, body.replace('1', '2'), proof)).toBe(false);
+    expect(verifyResponseProof(token, 'ef'.repeat(16), 200, body, proof)).toBe(false);
+    expect(verifyResponseProof('z'.repeat(64), challenge, 200, body, proof)).toBe(false);
+    expect(verifyResponseProof(token, challenge, 200, body, proof.slice(1))).toBe(false);
+    expect(verifyResponseProof(token, challenge, 200, body, null)).toBe(false);
   });
 
   it('NonceCache rejects replays, forgets after the TTL, and fails closed when full', () => {

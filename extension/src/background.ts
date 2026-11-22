@@ -14,7 +14,7 @@ import { findIdleInteractiveGroup, idlePlaceholderUrl, parkIdleInteractiveTab, c
 import * as executor from './cdp';
 import * as identity from './identity';
 import { executeWithJournal } from './journal';
-import { authorizationHeader, constantTimeEqual, expectedDaemonProof, importDaemonKey, randomNonce, signParts } from './daemon-auth';
+import { authorizationHeader, constantTimeEqual, expectedDaemonProof, importDaemonKey, randomNonce, signParts, verifyResponseProof } from './daemon-auth';
 
 let ws: WebSocket | null = null;
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
@@ -1396,7 +1396,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg?.type === 'getStatus') {
     void (async () => {
       const contextId = await getCurrentContextId();
-      const connected = ws?.readyState === WebSocket.OPEN;
+      const connected = !!ws && ws.readyState === WebSocket.OPEN && verifiedSockets.has(ws);
       const extensionVersion = chrome.runtime.getManifest().version;
       const daemonVersion = connected ? await fetchDaemonVersion() : null;
       sendResponse({
@@ -1421,14 +1421,22 @@ async function fetchDaemonVersion(): Promise<string | null> {
   try {
     const token = await loadDaemonToken();
     if (!token) return null;
-    const auth = authorizationHeader(await signParts(await importDaemonKey(token), 'GET', '/status'));
+    const key = await importDaemonKey(token);
+    const auth = authorizationHeader(await signParts(key, 'GET', '/status'));
+    const challenge = randomNonce();
     const res = await fetch(`http://${DAEMON_HOST}:${DAEMON_PORT}/status`, {
       method: 'GET',
-      headers: { 'X-OpenCLI': '1', Authorization: auth },
+      headers: { 'X-OpenCLI': '1', Authorization: auth, 'X-OpenCLI-Challenge': challenge },
       signal: AbortSignal.timeout(1500),
     });
+    // Use nothing from a reply the daemon did not authenticate.
+    const raw = await res.arrayBuffer();
+    if (!await verifyResponseProof(key, challenge, res.status, raw, res.headers.get('X-OpenCLI-Proof'))) {
+      console.warn('[opencli] unauthenticated /status reply on the daemon port; ignoring it');
+      return null;
+    }
     if (!res.ok) return null;
-    const body = await res.json() as { daemonVersion?: unknown };
+    const body = JSON.parse(new TextDecoder().decode(raw)) as { daemonVersion?: unknown };
     return typeof body.daemonVersion === 'string' ? body.daemonVersion : null;
   } catch {
     return null;

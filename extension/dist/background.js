@@ -957,6 +957,14 @@ function constantTimeEqual(a, b) {
   for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
   return diff === 0;
 }
+async function verifyResponseProof(key, challenge, status, body, proof) {
+  if (!proof) return false;
+  const bodyHash = toHex(await crypto.subtle.digest("SHA-256", body));
+  return constantTimeEqual(proof, await hmacHex(key, `opencli-response
+${challenge}
+${status}
+${bodyHash}`));
+}
 
 let ws = null;
 let reconnectTimer = null;
@@ -1948,7 +1956,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg?.type === "getStatus") {
     void (async () => {
       const contextId = await getCurrentContextId();
-      const connected = ws?.readyState === WebSocket.OPEN;
+      const connected = !!ws && ws.readyState === WebSocket.OPEN && verifiedSockets.has(ws);
       const extensionVersion = chrome.runtime.getManifest().version;
       const daemonVersion = connected ? await fetchDaemonVersion() : null;
       sendResponse({
@@ -1967,14 +1975,21 @@ async function fetchDaemonVersion() {
   try {
     const token = await loadDaemonToken();
     if (!token) return null;
-    const auth = authorizationHeader(await signParts(await importDaemonKey(token), "GET", "/status"));
+    const key = await importDaemonKey(token);
+    const auth = authorizationHeader(await signParts(key, "GET", "/status"));
+    const challenge = randomNonce();
     const res = await fetch(`http://${DAEMON_HOST}:${DAEMON_PORT}/status`, {
       method: "GET",
-      headers: { "X-OpenCLI": "1", Authorization: auth },
+      headers: { "X-OpenCLI": "1", Authorization: auth, "X-OpenCLI-Challenge": challenge },
       signal: AbortSignal.timeout(1500)
     });
+    const raw = await res.arrayBuffer();
+    if (!await verifyResponseProof(key, challenge, res.status, raw, res.headers.get("X-OpenCLI-Proof"))) {
+      console.warn("[opencli] unauthenticated /status reply on the daemon port; ignoring it");
+      return null;
+    }
     if (!res.ok) return null;
-    const body = await res.json();
+    const body = JSON.parse(new TextDecoder().decode(raw));
     return typeof body.daemonVersion === "string" ? body.daemonVersion : null;
   } catch {
     return null;

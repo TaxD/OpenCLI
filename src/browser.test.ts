@@ -283,7 +283,7 @@ describe('BrowserBridge state', () => {
     expect(killSpy).not.toHaveBeenCalled();
   });
 
-  it('falls back to SIGKILL when stale daemon refuses graceful shutdown', async () => {
+  it('never signals the PID reported by a stale daemon that refuses graceful shutdown', async () => {
     vi.spyOn(daemonTransport, 'getDaemonHealth').mockResolvedValue({
       state: 'no-extension',
       status: {
@@ -298,44 +298,13 @@ describe('BrowserBridge state', () => {
       },
     });
     vi.spyOn(daemonLifecycle.daemonLifecycleHooks, 'requestDaemonShutdown').mockResolvedValue(false);
-    // Graceful shutdown short-circuits to false (requestDaemonShutdown -> false).
-    // After SIGKILL the port is released, so the second waitForDaemonStop returns true.
-    vi.spyOn(daemonLifecycle.daemonLifecycleHooks, 'waitForDaemonStop').mockResolvedValue(true);
-    vi.spyOn(daemonLifecycle.daemonLifecycleHooks, 'spawnDaemonProcess').mockReturnValue(null as unknown as ReturnType<typeof daemonLifecycle.spawnDaemonProcess>);
+    const spawn = vi.spyOn(daemonLifecycle.daemonLifecycleHooks, 'spawnDaemonProcess');
     const killSpy = vi.spyOn(process, 'kill').mockImplementation(() => true);
 
     const bridge = new BrowserBridge();
 
-    // We expect the stale-daemon path to succeed and then continue into the
-    // no-extension wait (which times out with `timeout: 0.1`), producing the
-    // extension-not-connected error rather than the stale-daemon error.
-    await expect(bridge.connect({ timeout: 0.1 })).rejects.toThrow('Browser Bridge extension not connected');
-    expect(killSpy).toHaveBeenCalledWith(99999, 'SIGKILL');
-  });
-
-  it('reports stale daemon error when SIGKILL fails to release the port', async () => {
-    vi.spyOn(daemonTransport, 'getDaemonHealth').mockResolvedValue({
-      state: 'no-extension',
-      status: {
-        ok: true,
-        pid: 99999,
-        uptime: 0,
-        daemonVersion: '0.0.1',
-        extensionConnected: false,
-        pending: 0,
-        memoryMB: 0,
-        port: 0,
-      },
-    });
-    vi.spyOn(daemonLifecycle.daemonLifecycleHooks, 'requestDaemonShutdown').mockResolvedValue(false);
-    // Graceful + SIGKILL both fail to release the port.
-    vi.spyOn(daemonLifecycle.daemonLifecycleHooks, 'waitForDaemonStop').mockResolvedValue(false);
-    vi.spyOn(process, 'kill').mockImplementation(() => {
-      throw Object.assign(new Error('EPERM'), { code: 'EPERM' });
-    });
-
-    const bridge = new BrowserBridge();
-
     await expect(bridge.connect({ timeout: 0.1 })).rejects.toThrow('Stale daemon could not be replaced');
+    expect(killSpy).not.toHaveBeenCalled();
+    expect(spawn).not.toHaveBeenCalled();
   });
 });

@@ -7,7 +7,15 @@ import { BrowserConnectError } from '../errors.js';
 import { PKG_VERSION } from '../version.js';
 import { waitForBridgeReady } from './bridge-readiness.js';
 import { isDaemonStale } from './daemon-version.js';
-import { fetchDaemonStatus, getDaemonHealth, requestDaemonShutdown, type DaemonHealth, type DaemonStatus } from './daemon-transport.js';
+import { fetchDaemonStatus, getDaemonHealth, isDaemonManaged, requestDaemonShutdown, type DaemonHealth, type DaemonStatus } from './daemon-transport.js';
+
+function managedModeError(what: string): BrowserConnectError {
+  return new BrowserConnectError(
+    `opencli daemon ${what} (OPENCLI_DAEMON_MANAGED=1)`,
+    'The daemon is managed externally: the CLI does not start, restart or stop it. Start it with your service manager.',
+    'daemon-not-running',
+  );
+}
 
 export interface DaemonLaunchSpec {
   binary: string;
@@ -37,6 +45,7 @@ export function resolveDaemonLaunchSpec(): DaemonLaunchSpec {
 }
 
 export function spawnDaemonProcess(): ChildProcess {
+  if (isDaemonManaged()) throw managedModeError('is not running and will not be auto-started');
   const launch = resolveDaemonLaunchSpec();
   const proc = spawn(launch.binary, launch.args, {
     detached: true,
@@ -74,6 +83,7 @@ export const daemonLifecycleHooks = {
 };
 
 export async function restartDaemon(opts: { stopTimeoutMs?: number; startTimeoutMs?: number } = {}): Promise<DaemonRestartResult> {
+  if (isDaemonManaged()) throw managedModeError('restart refused');
   const previousStatus = await fetchDaemonStatus();
   let stopped = previousStatus === null;
   if (previousStatus) {
@@ -98,38 +108,35 @@ export async function ensureBrowserBridgeReady(
   const contextId = opts.contextId;
   const preferredContextId = opts.preferredContextId;
 
+  // getDaemonHealth throws UnauthenticatedDaemonError when whatever holds the
+  // port cannot prove it is our daemon — we then neither spawn nor stop anything.
   const health = await getDaemonHealth({ contextId, preferredContextId });
   const daemonVersion = health.status?.daemonVersion;
   const isStale = isDaemonStale(health.status, PKG_VERSION);
   let staleDaemonReplaced = false;
 
-  if (isStale) {
+  if (isDaemonManaged()) {
+    if (health.state === 'stopped') throw managedModeError('is not running and will not be auto-started');
+    if (isStale && verbose && (process.env.OPENCLI_VERBOSE || process.stderr.isTTY)) {
+      process.stderr.write(`⚠️  Daemon v${daemonVersion ?? '?'} ≠ CLI v${PKG_VERSION}; not restarting (OPENCLI_DAEMON_MANAGED=1).\n`);
+    }
+  } else if (isStale) {
     const reason = daemonVersion
       ? `v${daemonVersion} ≠ v${PKG_VERSION}`
       : `pre-version daemon, CLI is v${PKG_VERSION}`;
     if (verbose && (process.env.OPENCLI_VERBOSE || process.stderr.isTTY)) {
       process.stderr.write(`⚠️  Stale daemon detected (${reason}). Restarting...\n`);
     }
+    // Only an authenticated /shutdown. Never signal a PID taken from a daemon
+    // response: that number is not ours to kill.
     const shutdownAccepted = await daemonLifecycleHooks.requestDaemonShutdown();
-    let portReleased = shutdownAccepted && await daemonLifecycleHooks.waitForDaemonStop(3000);
-
-    if (!portReleased) {
-      const stalePid = health.status?.pid;
-      if (typeof stalePid === 'number' && Number.isInteger(stalePid) && stalePid > 0) {
-        try {
-          process.kill(stalePid, 'SIGKILL');
-        } catch {
-          // EPERM / ESRCH are both resolved by polling the fixed daemon port.
-        }
-        portReleased = await daemonLifecycleHooks.waitForDaemonStop(2000);
-      }
-    }
+    const portReleased = shutdownAccepted && await daemonLifecycleHooks.waitForDaemonStop(5000);
 
     if (!portReleased) {
       throw new BrowserConnectError(
         'Stale daemon could not be replaced',
-        `A stale daemon (${reason}) is running but did not shut down (graceful + SIGKILL both failed).\n` +
-        '  Run manually: opencli daemon stop',
+        `A stale daemon (${reason}) is running but did not shut down after an authenticated /shutdown.\n` +
+        `  Stop it manually (e.g. find it with: lsof -nP -iTCP:${DEFAULT_DAEMON_PORT} -sTCP:LISTEN) and retry.`,
         'daemon-not-running',
       );
     }
@@ -186,6 +193,7 @@ function browserConnectErrorFromHealth(health: DaemonHealth, contextId?: string)
       'extension-not-connected',
     );
   }
+  if (isDaemonManaged()) return managedModeError('is not running');
   return new BrowserConnectError(
     'Failed to start opencli daemon',
     `Try running manually:\n  node ${resolveDaemonLaunchSpec().scriptPath}\nMake sure port ${DEFAULT_DAEMON_PORT} is available.`,

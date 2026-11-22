@@ -1214,6 +1214,42 @@ describe('background tab isolation', () => {
     });
   });
 
+  it.each([
+    ['no proof', undefined, null],
+    ['a wrong proof', () => 'b'.repeat(64), null],
+    ['a proof over a different body', async (c: string) => refHmac(`opencli-response\n${c}\n200\n${hexOf(await crypto.subtle.digest('SHA-256', new TextEncoder().encode('{}')))}`), null],
+    ['a valid proof', async (c: string, body: string) => refHmac(`opencli-response\n${c}\n200\n${hexOf(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(body)))}`), '2.0.3-reach.3'],
+  ] as const)('popup status uses /status daemonVersion only with a valid response proof (%s)', async (_label, proof, expected) => {
+    const { chrome } = createChromeMock();
+    vi.stubGlobal('chrome', chrome);
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const body = JSON.stringify({ ok: true, daemonVersion: '2.0.3-reach.3' });
+    const statusRequests: RequestInit[] = [];
+    vi.stubGlobal('fetch', withDaemonToken(vi.fn(async (url: string, init?: RequestInit) => {
+      if (!String(url).endsWith('/status')) return { ok: true };
+      statusRequests.push(init!);
+      const challenge = (init!.headers as Record<string, string>)['X-OpenCLI-Challenge'];
+      const headers: Record<string, string> = proof ? { 'X-OpenCLI-Proof': await proof(challenge, body) } : {};
+      return new Response(body, { status: 200, headers });
+    })));
+
+    const mod = await import('./background');
+    await mod.__test__.connectForTest();
+    await completeDaemonHandshake(MockWebSocket.instances[0]);
+
+    const onMessageListener = chrome.runtime.onMessage.addListener.mock.calls[0][0];
+    const sendResponse = vi.fn();
+    onMessageListener({ type: 'getStatus' }, {}, sendResponse);
+    await vi.waitFor(() => {
+      expect(sendResponse).toHaveBeenCalledWith(expect.objectContaining({ connected: true, daemonVersion: expected }));
+    });
+    expect(statusRequests).toHaveLength(1);
+    const headers = statusRequests[0].headers as Record<string, string>;
+    expect(headers['X-OpenCLI-Challenge']).toMatch(/^[0-9a-f]{32}$/);
+    expect(headers.Authorization).toMatch(/^OpenCLI-HMAC /);
+    expect(JSON.stringify(headers)).not.toContain(TEST_DAEMON_TOKEN);
+  });
+
   it('keeps the active daemon connection when a superseded WebSocket closes later', async () => {
     const { chrome } = createChromeMock();
     vi.stubGlobal('chrome', chrome);

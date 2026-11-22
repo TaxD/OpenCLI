@@ -52,3 +52,15 @@ export function constantTimeEqual(a: string, b: string): boolean {
   for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
   return diff === 0;
 }
+
+/**
+ * Daemon response authentication: X-OpenCLI-Proof =
+ * HMAC(key, "opencli-response\n" + challenge + "\n" + status + "\n" + sha256hex(body)).
+ */
+export async function verifyResponseProof(
+  key: CryptoKey, challenge: string, status: number, body: ArrayBuffer, proof: string | null,
+): Promise<boolean> {
+  if (!proof) return false;
+  const bodyHash = toHex(await crypto.subtle.digest('SHA-256', body));
+  return constantTimeEqual(proof, await hmacHex(key, `opencli-response\n${challenge}\n${status}\n${bodyHash}`));
+}

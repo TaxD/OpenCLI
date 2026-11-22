@@ -1,4 +1,6 @@
-import { authorizationHeader, daemonTokenPath, readDaemonTokenOrNull, signParts } from '../daemon-auth.js';
+import {
+  CHALLENGE_HEADER, PROOF_HEADER, authorizationHeader, daemonTokenPath, newNonce, readDaemonTokenOrNull, signParts, verifyResponseProof,
+} from '../daemon-auth.js';
 import { BrowserConnectError } from '../errors.js';
 import { DAEMON_HOST, DEFAULT_DAEMON_PORT, isIgnorableDaemonPortEnv, unsupportedDaemonPortEnvMessage } from '../constants.js';
 
@@ -10,6 +12,33 @@ class UnsupportedDaemonPortEnvError extends Error {
   constructor(value: string) {
     super(unsupportedDaemonPortEnvMessage(value));
     this.name = 'UnsupportedDaemonPortEnvError';
+  }
+}
+
+/** OPENCLI_DAEMON_MANAGED=1: an external manager owns the daemon's lifetime. */
+export function isDaemonManaged(): boolean {
+  return process.env.OPENCLI_DAEMON_MANAGED === '1';
+}
+
+/**
+ * Whatever answered on the daemon port could not prove it holds the token.
+ * Nothing from that response (status, pid, version) may be used, and the CLI
+ * must neither spawn a replacement nor send it a shutdown.
+ */
+export class UnauthenticatedDaemonError extends BrowserConnectError {
+  constructor(reason: 'no-token' | 'bad-proof') {
+    super(
+      reason === 'no-token'
+        ? `Something is listening on port ${DEFAULT_DAEMON_PORT}, but the daemon token at ${daemonTokenPath()} cannot be read`
+        : `An unauthenticated program is listening on port ${DEFAULT_DAEMON_PORT}: its response did not carry a valid opencli daemon proof`,
+      reason === 'no-token'
+        ? 'Make sure the token file exists, is owned by you with mode 600, and OPENCLI_DAEMON_TOKEN_FILE matches the daemon.'
+        : `Its reply was ignored. Either another program (possibly another user's) holds port ${DEFAULT_DAEMON_PORT}, ` +
+          'or the running daemon uses a different token file. Identify it (e.g. lsof -nP -iTCP:' + DEFAULT_DAEMON_PORT +
+          ' -sTCP:LISTEN), stop it yourself, and retry.',
+      'daemon-unauthenticated',
+    );
+    this.name = 'UnauthenticatedDaemonError';
   }
 }
 
@@ -57,8 +86,7 @@ export type DaemonHealth =
  * body hash; the token itself never leaves this process. Re-read per request:
  * the daemon may create the token file after the CLI started.
  */
-function authHeader(method: string, url: URL, body: RequestInit['body']): Record<string, string> {
-  const token = readDaemonTokenOrNull();
+function authHeader(token: string | null, method: string, url: URL, body: RequestInit['body']): Record<string, string> {
   if (!token) return {};
   if (body != null && typeof body !== 'string' && !(body instanceof Uint8Array)) {
     throw new TypeError('requestDaemon only supports string or Uint8Array bodies');
@@ -66,6 +94,11 @@ function authHeader(method: string, url: URL, body: RequestInit['body']): Record
   return { Authorization: authorizationHeader(signParts(token, method, url.pathname + url.search, body ?? undefined)) };
 }
 
+/**
+ * Signed request + authenticated response. The returned Response is rebuilt
+ * from bytes whose X-OpenCLI-Proof was verified; an unverifiable reply throws
+ * UnauthenticatedDaemonError and is never surfaced.
+ */
 export async function requestDaemon(pathname: string, init?: RequestInit & { timeout?: number }): Promise<Response> {
   assertSupportedDaemonPortEnv();
   const { timeout = 2000, headers, ...rest } = init ?? {};
@@ -73,11 +106,24 @@ export async function requestDaemon(pathname: string, init?: RequestInit & { tim
   const timer = setTimeout(() => controller.abort(), timeout);
   try {
     const url = new URL(`${DAEMON_URL}${pathname}`);
-    return await fetch(url.href, {
+    const token = readDaemonTokenOrNull();
+    const challenge = newNonce();
+    const res = await fetch(url.href, {
       ...rest,
-      headers: { ...OPENCLI_HEADERS, ...authHeader(rest.method ?? 'GET', url, rest.body), ...headers },
+      headers: {
+        ...OPENCLI_HEADERS,
+        ...authHeader(token, rest.method ?? 'GET', url, rest.body),
+        ...headers,
+        [CHALLENGE_HEADER]: challenge,
+      },
       signal: controller.signal,
     });
+    const body = new Uint8Array(await res.arrayBuffer());
+    if (!token) throw new UnauthenticatedDaemonError('no-token');
+    if (!verifyResponseProof(token, challenge, res.status, body, res.headers.get(PROOF_HEADER))) {
+      throw new UnauthenticatedDaemonError('bad-proof');
+    }
+    return new Response(body.length ? body : null, { status: res.status, headers: res.headers });
   } finally {
     clearTimeout(timer);
   }
@@ -94,11 +140,10 @@ export async function fetchDaemonStatus(opts?: { timeout?: number; contextId?: s
     // would only hit EADDRINUSE. Say why instead.
     if (res.status === 401) {
       throw new BrowserConnectError(
-        'opencli daemon rejected the request (Unauthorized)',
-        `The CLI could not authenticate with the daemon token at ${daemonTokenPath()}. ` +
-        'Make sure the file exists, is owned by you with mode 600, and matches the running daemon ' +
-        '(set OPENCLI_DAEMON_TOKEN_FILE consistently).',
-        'daemon-not-running',
+        'opencli daemon rejected the request signature (Unauthorized)',
+        `The daemon proved it holds the token at ${daemonTokenPath()} but rejected this request ` +
+        '(system clock off by more than 30s, or a replayed nonce). Check the clock and retry.',
+        'daemon-unauthenticated',
       );
     }
     if (!res.ok) return null;
@@ -119,11 +164,18 @@ export async function getDaemonHealth(opts?: { timeout?: number; contextId?: str
 }
 
 export async function requestDaemonShutdown(opts?: { timeout?: number }): Promise<boolean> {
+  if (isDaemonManaged()) {
+    throw new BrowserConnectError(
+      'Refusing to stop the daemon: OPENCLI_DAEMON_MANAGED=1',
+      'The daemon is managed externally; stop it with your service manager.',
+      'daemon-not-running',
+    );
+  }
   try {
     const res = await requestDaemon('/shutdown', { method: 'POST', timeout: opts?.timeout ?? 5000 });
     return res.ok;
   } catch (err) {
-    if (err instanceof UnsupportedDaemonPortEnvError) throw err;
+    if (err instanceof UnsupportedDaemonPortEnvError || err instanceof BrowserConnectError) throw err;
     return false;
   }
 }

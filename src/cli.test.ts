@@ -10,6 +10,7 @@ import { BrowserCommandError } from './browser/daemon-client.js';
 import type { IPage } from './types.js';
 import { TargetError } from './browser/target-errors.js';
 import { PKG_VERSION } from './version.js';
+import { responseProof } from './daemon-auth.js';
 
 const {
   mockBrowserConnect,
@@ -925,20 +926,26 @@ describe('profile list', () => {
   });
 
   it('reports stale daemon instead of no profiles when status lacks profile support', async () => {
-    vi.mocked(fetch).mockResolvedValue({
+    // The CLI only trusts daemon replies carrying a valid X-OpenCLI-Proof.
+    const token = 'p'.repeat(64);
+    const tokenFile = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'opencli-cli-')), 'daemon-token');
+    fs.writeFileSync(tokenFile, token, { mode: 0o600 });
+    vi.stubEnv('OPENCLI_DAEMON_TOKEN_FILE', tokenFile);
+    const body = JSON.stringify({
       ok: true,
-      json: async () => ({
-        ok: true,
-        pid: 123,
-        uptime: 1,
-        daemonVersion: '1.7.6',
-        extensionConnected: true,
-        extensionVersion: '1.0.3',
-        pending: 0,
-        memoryMB: 20,
-        port: 19825,
-      }),
-    } as Response);
+      pid: 123,
+      uptime: 1,
+      daemonVersion: '1.7.6',
+      extensionConnected: true,
+      extensionVersion: '1.0.3',
+      pending: 0,
+      memoryMB: 20,
+      port: 19825,
+    });
+    vi.mocked(fetch).mockImplementation(async (_url, init) => new Response(body, {
+      status: 200,
+      headers: { 'X-OpenCLI-Proof': responseProof(token, (init?.headers as Record<string, string>)['X-OpenCLI-Challenge'], 200, body) },
+    }));
     const program = createProgram('', '');
 
     await program.parseAsync(['node', 'opencli', 'profile', 'list']);
@@ -947,6 +954,7 @@ describe('profile list', () => {
     expect(JSON.parse(output).data.daemonStale).toBe(true);
     expect(JSON.parse(output).data.daemonRunning).toBe(true);
     expect(output).not.toContain('No Browser Bridge profiles connected');
+    vi.unstubAllEnvs();
   });
 
   it('keeps the empty profile message for current daemon status with no profiles', async () => {
